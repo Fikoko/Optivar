@@ -1,6 +1,6 @@
 
 # Ɵ-Programming-Language
-Ɵ (Optivar) is an extremely strict and extremely declarative programming language designed for prioritizing simplicity and performance through defining immutable variables and using a comprehensive library of pre-defined, highly optimized functions. 
+Ɵ (Optivar) is an extremely strict and extremely declarative programming language designed for prioritizing simplicity and performance through defining variables and using a comprehensive library of pre-defined, highly optimized functions. 
 
 ## Description
 This programming language is created in order to leave the manual function creation (operators such as additions, substractions, loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via a minimalist turing complete instruction list (command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP") depending on "hardware infrastructure". So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables.
@@ -48,20 +48,18 @@ sudo make install
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them, print the result, and return the sum
 
--- === Library Inclusions ===
+--libraries
 let my_lib = include("lib.h", "C://user/libs/");
 
--- === Variable Declarations ===
+--variables
 let a = read_undec_num();              -- Read the first undeclared number
 let b = read_undec_num();              -- Read the second undeclared number
 let b = add_undec_num(a, b);           -- Add numbers, reuse b for sum
 
--- === Output ===
+--output
 let a = print(string("Sum is: "));      -- Print label, reuse a
 let a = print(b);                       -- Print sum
 let a = print(string("\n"));            -- Print newline
-
--- === Return ===
 let a = return(b);                      -- Return sum as exit code
 ```
 
