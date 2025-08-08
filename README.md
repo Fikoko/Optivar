@@ -3,26 +3,66 @@
 Ɵ (Optivar) is an extremely strict and extremely declarative programming language designed for prioritizing simplicity and performance through defining immutable variables and using a comprehensive library of pre-defined, highly optimized functions. 
 
 ## Description
-Optivar programming language is created in order to leave the manual function creation (loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via "a minimalist turing complete instruction list"         ( command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP" ) depending on "hardware infrastructure". So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables.
+This programming language is created in order to leave the manual function creation (operators such as additions, substractions, loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via a minimalist turing complete instruction list (command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP") depending on "hardware infrastructure". So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables.
 
 ## Getting Started
 
+![Community](https://img.shields.io/badge/community-join-blue.svg) ![Contribute](https://img.shields.io/badge/contribute-join-yellow.svg)
+
+Copyright © 2025 Fikret Güney Ersezer. All rights reserved.
+
+See the end of this file for further copyright and license information.
+
+This repository only includes simple parser and simple debugger.
+
 ### Dependencies
 
-* Describe any prerequisites, libraries, OS version, etc., needed before installing program.
-* ex. Windows 10
+* Regardless of future releases of libraries, the logic behind parsing and debugging will not change. Any dependency issue is related with the library conditions.
 
 ### Installing
 
-* How/where to download your program
-* Any modifications needed to be made to files/folders
-
-### Executing program
-
-* How to run the program
-* Step-by-step bullets
+* How to download the parser and debugger:
+  
 ```
-code blocks for commands
+git clone https://github.com/[YourUsername]/optivar.git
+cd optivar
+./configure
+make
+make test
+sudo make install
+```
+  
+
+### Philosophy and Execution of code
+
+* Philosophy of Code
+  
+  ```
+  Natural language summary (the simplest explaination of what user desire)
+  Comment-per-line (explaining why the function below is selected instead of others)
+  Function-based code (pure declarative variable assignment)
+  ```
+
+* Exectution of Code
+
+```
+-- add_numbers.optivar: Read two undeclared numbers, add them, print the result, and return the sum
+
+-- === Library Inclusions ===
+let my_lib = include("lib.h", "C://user/libs/");
+
+-- === Variable Declarations ===
+let a = read_undec_num();              -- Read the first undeclared number
+let b = read_undec_num();              -- Read the second undeclared number
+let b = add_undec_num(a, b);           -- Add numbers, reuse b for sum
+
+-- === Output ===
+let a = print(string("Sum is: "));      -- Print label, reuse a
+let a = print(b);                       -- Print sum
+let a = print(string("\n"));            -- Print newline
+
+-- === Return ===
+let a = return(b);                      -- Return sum as exit code
 ```
 
 ## Help
@@ -33,23 +73,16 @@ command to run if program contains helper info
 ```
 
 ## Authors
-
-Contributors names and contact info
-
-ex. Dominique Pizzie  
-ex. [@DomPizzie](https://twitter.com/dompizzie)
+Fikret Güney Ersezer
 
 ## Version History
 
-* 0.2
-    * Various bug fixes and optimizations
-    * See [commit change]() or See [release history]()
 * 0.1
     * Initial Release
 
 ## License
 
-This project is licensed under the [NAME HERE] License - see the LICENSE.md file for details
+This project is licensed under the [GPLv3] License - see the LICENSE.md file for details
 
 ## Acknowledgments
 
