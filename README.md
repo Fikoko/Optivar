@@ -24,7 +24,7 @@ This repository only includes simple parser and simple debugger.
 * How to download the parser and debugger:
   
 ```
-git clone https://github.com/[YourUsername]/optivar.git
+git clone https://github.com/Fikoko/optivar.git
 cd optivar
 ./configure
 make
