@@ -5,6 +5,12 @@
 ## Description
 This programming language is created in order to leave the manual function creation (operators such as additions, substractions, loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via a minimalist turing complete instruction list (command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP") depending on "hardware infrastructure". So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables.
 
+Whole programming language has only 2 syntax structure:
+
+1)  let y1 = f( x1 , x2 , x3 , ... );
+2)  -- comment 
+
+
 ## Getting Started
 
 ![Community](https://img.shields.io/badge/community-join-blue.svg) ![Contribute](https://img.shields.io/badge/contribute-join-yellow.svg)
@@ -48,10 +54,6 @@ sudo make install
 | **No types in syntax**                  | Types are inferred or handled within function contracts                        |
 | **Natural language-inspired structure** | Heavy emphasis on readability, flow, and structured comments                   |
 
-Whole programming language has the following rules: 
-
-1)  let y1 = f( x1 , x2 , x3 , ... );
-2)  -- comment 
 
 * Exectution of Code
 
