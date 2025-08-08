@@ -36,12 +36,22 @@ sudo make install
 ### Philosophy and Execution of code
 
 * Philosophy of Code
-  
-  ```
-  Natural language summary (the simplest explaination of what user desire)
-  Comment-per-line (explaining why the function below is selected instead of others)
-  Function-based code (pure declarative variable assignment)
-  ```
+
+| Feature                                 | Description                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------ |
+| **Strictly declarative**                | No control flow, no conditionals, no loops — just a sequence of function calls |
+| **Function-only**                       | Every operation (even `+`, `return`, I/O) is a function                        |
+| **Controlled rebindable variables**     | Variables can be reassigned if previous values are no longer needed            |
+| **Compiler-driven optimization**        | Variable reuse, memory reuse, SSA transformation, etc.                         |
+| **Disposable values**                   | Through functions like `run()`, `discard()`                                    |
+| **Library-based execution**             | Core behaviors (math, I/O, types) come from external libraries                 |
+| **No types in syntax**                  | Types are inferred or handled within function contracts                        |
+| **Natural language-inspired structure** | Heavy emphasis on readability, flow, and structured comments                   |
+
+Whole programming language has the following rules: 
+
+1)  let y1 = f( x1 , x2 , x3 , ... );
+2)  -- comment 
 
 * Exectution of Code
 
