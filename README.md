@@ -19,7 +19,7 @@ Copyright © 2025 Fikret Güney Ersezer. All rights reserved.
 
 See the end of this file for further copyright and license information.
 
-This repository only includes simple parser and simple debugger.
+This repository can be used for most recent compiler/debugger.
 
 ### Dependencies
 
