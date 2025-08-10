@@ -69,19 +69,16 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 * Example of Code
 
 ```
--- add_numbers.optivar: Read two undeclared numbers, add them, print the result, and return the sum
+-- add_numbers.optivar: Read two undeclared numbers, add them and return the sum
 
 --input
-let my_lib = include("lib.h", "C://user/libs/");
-let a = read_undec_num();              -- Read the first undeclared number
-let b = read_undec_num();              -- Read the second undeclared number
-let b = add_undec_num(a, b);           -- Add numbers, reuse b for sum
+let my_lib = include("lib.h", "C://user/libs/");   -- Apply the include( ) function with the "lib.h", "C://user/libs/" variables and store it at my_lib variable
+let a = read_undec_num();                          -- Apply the read_undec_num() function and store it at "a" variable
+let b = read_undec_num();                          -- Apply the read_undec_num() function and store it at "b" variable
+let b = add_undec_num(a, b);                       -- Apply the add_undec_num() function with the "a", "b" variables and store them at "b" variable
 
 --output
-let a = print(string("Sum is: "));      -- Print label, reuse a
-let a = print(b);                       -- Print sum
-let a = print(string("\n"));            -- Print newline
-let a = return(b);                      -- Return sum as exit code
+let a = return(b);                      -- Apply the return() function with the "b" variable and store it at "a" variable
 ```
 
 ## Help
