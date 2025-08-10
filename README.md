@@ -60,11 +60,8 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 | Feature                                 | Description                                                                    |
 | --------------------------------------- | ------------------------------------------------------------------------------ |
 | **Strictly declarative**                | No control flow, no conditionals, no loops — just a sequence of function calls |
-| **Function-only**                       | Every operation (even arithmetic, variables, control, I/O etc...) is function  |
-| **Controlled rebindable variables**     | Variables can be reassigned if previous values are no longer needed            |
-| **Compiler-driven optimization**        | Variable reuse, memory reuse, SSA transformation, etc.                         |
-| **Disposable values**                   | Through functions like `run()`, `discard()`                                    |
-| **Library-based execution**             | Core behaviors (math, I/O, types etc...) come from external libraries          |
+| **Function-only**                       | Every operation (arithmetic, variables, control flows, I/O etc...) is function |
+| **Library-based execution**             | Everything come from external libraries                                        |
 | **No types in syntax**                  | Types are inferred or handled within function contracts                        |
 | **Natural language-inspired structure** | Heavy emphasis on readability, flow, and structured comments                   |
 
