@@ -59,10 +59,9 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 
 | Feature                                 | Description                                                                    |
 | --------------------------------------- | ------------------------------------------------------------------------------ |
-| **Strictly declarative**                | No control flow, no conditionals, no loops — just a sequence of function calls |
+| **Strictly declarative**                | No manual creation of anything — just function calls                           |
 | **Function-only**                       | Every operation (arithmetic, variables, control flows, I/O etc...) is function |
 | **Library-based execution**             | Everything come from external libraries                                        |
-| **No types in syntax**                  | Types are inferred or handled within function contracts                        |
 | **Natural language-inspired structure** | Heavy emphasis on readability, flow, and structured comments                   |
 
 
