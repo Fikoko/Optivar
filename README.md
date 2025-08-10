@@ -67,7 +67,7 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 
 
 
-* Exectution of Code
+* Example of Code
 
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them, print the result, and return the sum
