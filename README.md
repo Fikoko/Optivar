@@ -75,10 +75,8 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them, print the result, and return the sum
 
---libraries
+--input
 let my_lib = include("lib.h", "C://user/libs/");
-
---variables
 let a = read_undec_num();              -- Read the first undeclared number
 let b = read_undec_num();              -- Read the second undeclared number
 let b = add_undec_num(a, b);           -- Add numbers, reuse b for sum
