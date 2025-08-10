@@ -39,9 +39,19 @@ sudo make install
 ```
   
 
-### Philosophy and Execution of code
+### Historical Context and Novelty
+The concept of a declarative, minimalist language for both high-level users and low-level optimizers has roots in earlier paradigms but hasn’t been combined in this way:
 
-* Philosophy of Code
+1960s–1970s: APL and Forth explored minimalism and function-based programming, but not with Optivar’s declarative purity or hardware focus.
+
+1970s–1980s: SQL and Prolog established declarative programming, but they were domain-specific and lacked hardware optimization.
+
+1990s–2000s: LLVM IR and Haskell advanced optimization and declarative programming, but not with Optivar’s dual audience or extreme simplicity.
+
+Modern Era: Dataflow languages like LabVIEW and domain-specific tools show continued interest in declarative models, but none match Optivar’s general-purpose, hardware-oriented design.
+
+
+Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optimizable nature) and SQL (for its declarative simplicity), but its combination of a declarative frontend, researcher-driven low-level functions, and extreme syntactic minimalism is a fresh approach.
 
 | Feature                                 | Description                                                                    |
 | --------------------------------------- | ------------------------------------------------------------------------------ |
