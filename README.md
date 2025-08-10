@@ -53,6 +53,7 @@ Modern Era: Dataflow languages like LabVIEW and domain-specific tools show conti
 
 Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optimizable nature) and SQL (for its declarative simplicity), but its combination of a declarative frontend, researcher-driven low-level functions, and extreme syntactic minimalism is a fresh approach.
 
+
 | Feature                                 | Description                                                                    |
 | --------------------------------------- | ------------------------------------------------------------------------------ |
 | **Strictly declarative**                | No control flow, no conditionals, no loops — just a sequence of function calls |
@@ -63,6 +64,7 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 | **Library-based execution**             | Core behaviors (math, I/O, types etc...) come from external libraries          |
 | **No types in syntax**                  | Types are inferred or handled within function contracts                        |
 | **Natural language-inspired structure** | Heavy emphasis on readability, flow, and structured comments                   |
+
 
 
 * Exectution of Code
