@@ -7,9 +7,12 @@ This programming language is created in order to leave the manual function creat
 
 Whole programming language has only 2 syntax structure:
 
-1)  let y1 = f( x1 , x2 , x3 , ... );   // let the output y1 be equivalent of functional translation f of variables x1, x2 , x3 ...
+1)  let y1 = f( x1 , x2 , x3 , ... );   
 2)  -- comment 
 
+For simplicity, it is translated to natural language as:
+
+"let the output y1 be equivalent of functional translation f of variables x1, x2 , x3 ..."
 
 ## Getting Started
 
