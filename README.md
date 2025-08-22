@@ -7,12 +7,12 @@ This programming language is created in order to leave the manual function creat
 
 Whole programming language has only 2 syntax structure:
 
-1)  let y1 = f( x1 , x2 , x3 , ... );   
+1)  f( x1 , x2 , x3 , ... ) = y1;   
 2)  -- comment 
 
 For simplicity, it is translated to natural language as:
 
-"let the output y1 be equivalent of functional translation f of variables x1, x2 , x3 ..."
+"make functional translation f of variables x1, x2 , x3 ... as equivalent of the output y1"
 
 ## Getting Started
 
@@ -72,13 +72,13 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum
 
 --input
-let my_lib = include("lib.h", "C://user/libs/");   -- Apply the include( ) function with the "lib.h", "C://user/libs/" variables and store it at my_lib variable
-let a = read_undec_num();                          -- Apply the read_undec_num() function and store it at "a" variable
-let b = read_undec_num();                          -- Apply the read_undec_num() function and store it at "b" variable
-let b = add_undec_num(a, b);                       -- Apply the add_undec_num() function with the "a", "b" variables and store them at "b" variable
+include("lib.h", "C://user/libs/") = my_lib;   -- Apply the include( ) function with the "lib.h", "C://user/libs/" variables and store it at "my_lib" variable
+read_undec_num() = a;                          -- Apply the read_undec_num() function and store it at "a" variable
+read_undec_num() = b;                          -- Apply the read_undec_num() function and store it at "b" variable
+add_undec_num(a, b) = b;                       -- Apply the add_undec_num() function with the "a", "b" variables and store them at "b" variable
 
 --output
-let a = return(b);                      -- Apply the return() function with the "b" variable and store it at "a" variable
+return(b) = a;                      -- Apply the return() function with the "b" variable and store it at "a" variable
 ```
 
 ## Help
