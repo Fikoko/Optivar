@@ -17,7 +17,7 @@ Whole programming language has only 2 syntax structure:
 
 For simplicity, it is translated to natural language as:
 
-"make functional translation f of variables x1, x2 , x3 ... as equivalent of the output y1"
+"make functional translation f of variables/arguments x1, x2 , x3 ... as equivalent of the output y1"
 
 ## Getting Started
 
