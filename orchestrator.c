@@ -1,6 +1,6 @@
 // orchestrator.c
-// Optivar PL interpreter (x64)
-// Syntax: y = f(x1, x2, ...);   // only structure
+// Optivar non-compiled interpreter (x64)
+// Syntax: y = f(x1, x2, ...);
 // Comments: -- anything
 
 #define _GNU_SOURCE
@@ -72,19 +72,9 @@ static void env_set(Env* e, const char* name, Var* val) {
 // --- Simple var constructors ---
 static Var* var_int(long long i) { Var* v = malloc(sizeof(Var)); v->type = TYPE_INT; v->data.i_val = i; return v; }
 static Var* var_float(double f) { Var* v = malloc(sizeof(Var)); v->type = TYPE_FLOAT; v->data.f_val = f; return v; }
+static Var* var_string(const char* s) { Var* v = malloc(sizeof(Var)); v->type = TYPE_STRING; v->data.s_val = strdup(s); return v; }
+static Var* var_bool(int b) { Var* v = malloc(sizeof(Var)); v->type = TYPE_BOOL; v->data.b_val = b; return v; }
 static Var* var_null() { Var* v = malloc(sizeof(Var)); v->type = TYPE_NULL; return v; }
-
-// --- Print Var ---
-static void print_var(const Var* v) {
-    if(!v) { printf("null"); return; }
-    switch(v->type){
-        case TYPE_INT: printf("%lld", v->data.i_val); break;
-        case TYPE_FLOAT: printf("%g", v->data.f_val); break;
-        case TYPE_STRING: printf("%s", v->data.s_val); break;
-        case TYPE_BOOL: printf(v->data.b_val ? "true":"false"); break;
-        case TYPE_NULL: printf("null"); break;
-    }
-}
 
 // --- Load function binary ---
 static void* load_func(const char* name) {
@@ -101,75 +91,103 @@ static void* load_func(const char* name) {
     return buf;
 }
 
+// --- Determine type of literal ---
+static Var* parse_literal(const char* token) {
+    if(strcmp(token,"null")==0) return var_null();
+    if(strcmp(token,"true")==0) return var_bool(1);
+    if(strcmp(token,"false")==0) return var_bool(0);
+    char* endptr;
+    long long i = strtoll(token,&endptr,10);
+    if(*endptr=='\0') return var_int(i);
+    double f = strtod(token,&endptr);
+    if(*endptr=='\0') return var_float(f);
+    return var_string(token); // treat as string literal
+}
+
 // --- Parse and execute a single statement ---
 static void execute_statement(Env* env, char* stmt) {
+    // Remove comments
     char* comment = strstr(stmt,"--");
-    if(comment) *comment='\0'; // remove comment
+    if(comment) *comment='\0';
 
-    char* eq = strchr(stmt,'=');
+    // Skip empty lines
+    char* start = stmt;
+    while(isspace(*start)) start++;
+    if(*start=='\0') return;
+
+    // Split lhs and rhs
+    char* eq = strchr(start,'=');
     if(!eq) return; // invalid
     *eq='\0';
-    char* lhs = stmt;
+    char* lhs = start;
     char* rhs = eq+1;
     while(isspace(*lhs)) lhs++;
     while(isspace(*rhs)) rhs++;
 
-    // parse function call
+    // Parse function name
     char* paren = strchr(rhs,'(');
-    if(!paren) return;
-    char funcname[64];
-    int len = paren - rhs;
-    strncpy(funcname,rhs,len); funcname[len]='\0';
-    while(isspace(*funcname)) funcname++; 
+    if(!paren) return; // invalid
+    *paren = '\0';
+    char* funcname = rhs;
+    while(isspace(*funcname)) funcname++;
 
+    // Parse arguments string
     char* args_str = paren+1;
     char* close = strrchr(args_str,')');
     if(!close) return;
     *close='\0';
 
-    // parse arguments
-    int argc=0;
-    Var* argv[16];
+    // Dynamic argument array
+    int argc = 0;
+    int capacity = 4;
+    Var** argv = malloc(capacity * sizeof(Var*));
+
     char* token = strtok(args_str,",");
-    while(token && argc<16){
+    while(token){
         while(isspace(*token)) token++;
-        if(strcmp(token,"null")==0) argv[argc++] = var_null();
-        else argv[argc++] = var_int(atoll(token)); // for demo, all integers
+        if(*token=='\0') { token = strtok(NULL,","); continue; }
+
+        Var* v = env_get(env, token); // try variable
+        if(!v) v = parse_literal(token); // else literal
+        argv[argc++] = v;
+
+        if(argc>=capacity){
+            capacity *= 2;
+            argv = realloc(argv, capacity*sizeof(Var*));
+        }
+
         token = strtok(NULL,",");
     }
 
+    // Load function dynamically
     varfunc_t f = (varfunc_t)load_func(funcname);
-    if(!f){ printf("Error: function %s not found\n", funcname); return; }
+    if(!f){ printf("Error: function %s not found\n", funcname); free(argv); return; }
+
     Var* res = f(argv,argc);
     env_set(env,lhs,res);
 
-    for(int i=0;i<argc;i++) free(argv[i]);
+    free(argv);
 }
 
 int main(int argc,char** argv){
     if(argc<2){ printf("Usage: %s file.optivar\n",argv[0]); return 1; }
+
     Env env;
     env_init(&env);
 
     FILE* f = fopen(argv[1],"r");
     if(!f) { perror("fopen"); return 1; }
     fseek(f,0,SEEK_END);
-    long len=ftell(f);
+    long len = ftell(f);
     fseek(f,0,SEEK_SET);
     char* buf = malloc(len+1);
     fread(buf,1,len,f); fclose(f); buf[len]='\0';
 
-    char* stmt = strtok(buf,";\n");
+    // Split statements by ';'
+    char* stmt = strtok(buf,";");
     while(stmt){
         execute_statement(&env,stmt);
-        stmt = strtok(NULL,";\n");
-    }
-
-    printf("Environment:\n");
-    for(int i=0;i<env.count;i++){
-        printf("%s = ", env.entries[i].name);
-        print_var(env.entries[i].value);
-        printf("\n");
+        stmt = strtok(NULL,";");
     }
 
     free(buf);
