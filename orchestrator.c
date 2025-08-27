@@ -1,5 +1,5 @@
 // orchestrator.c
-// Optivar non-compiled interpreter (x64)
+// Ultra-minimal Optivar interpreter (x64)
 // Syntax: y = f(x1, x2, ...);
 // Comments: -- anything
 
@@ -8,22 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <errno.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
 
-typedef enum { TYPE_INT, TYPE_FLOAT, TYPE_STRING, TYPE_BOOL, TYPE_NULL } VarType;
+typedef enum { TYPE_OBJ } VarType;
 
 typedef struct Var {
-    VarType type;
-    union {
-        long long i_val;
-        double f_val;
-        char* s_val;
-        int b_val;
-    } data;
+    VarType type;   // always TYPE_OBJ
+    void* data;     // opaque pointer handled by external functions
 } Var;
 
 typedef struct {
@@ -40,72 +32,62 @@ typedef struct {
 typedef Var* (*varfunc_t)(Var** args, int count);
 
 // --- Environment functions ---
-static void env_init(Env* e) {
+static void env_init(Env* e){
     e->entries = NULL;
     e->count = e->capacity = 0;
 }
 
-static Var* env_get(Env* e, const char* name) {
+static Var* env_get(Env* e, const char* name){
     for(int i=0;i<e->count;i++)
-        if(strcmp(e->entries[i].name, name)==0) return e->entries[i].value;
+        if(strcmp(e->entries[i].name,name)==0) return e->entries[i].value;
     return NULL;
 }
 
-static void env_set(Env* e, const char* name, Var* val) {
-    for(int i=0;i<e->count;i++) {
-        if(strcmp(e->entries[i].name, name)==0) {
+static void env_set(Env* e, const char* name, Var* val){
+    for(int i=0;i<e->count;i++){
+        if(strcmp(e->entries[i].name,name)==0){
             free(e->entries[i].name);
             e->entries[i].name = strdup(name);
             e->entries[i].value = val;
             return;
         }
     }
-    if(e->count>=e->capacity) {
+    if(e->count>=e->capacity){
         e->capacity = e->capacity ? e->capacity*2 : 8;
-        e->entries = realloc(e->entries, e->capacity*sizeof(EnvEntry));
+        e->entries = realloc(e->entries,e->capacity*sizeof(EnvEntry));
     }
     e->entries[e->count].name = strdup(name);
     e->entries[e->count].value = val;
     e->count++;
 }
 
-// --- Simple var constructors ---
-static Var* var_int(long long i) { Var* v = malloc(sizeof(Var)); v->type = TYPE_INT; v->data.i_val = i; return v; }
-static Var* var_float(double f) { Var* v = malloc(sizeof(Var)); v->type = TYPE_FLOAT; v->data.f_val = f; return v; }
-static Var* var_string(const char* s) { Var* v = malloc(sizeof(Var)); v->type = TYPE_STRING; v->data.s_val = strdup(s); return v; }
-static Var* var_bool(int b) { Var* v = malloc(sizeof(Var)); v->type = TYPE_BOOL; v->data.b_val = b; return v; }
-static Var* var_null() { Var* v = malloc(sizeof(Var)); v->type = TYPE_NULL; return v; }
+// --- Load function binary dynamically (supports unlimited path length) ---
+static void* load_func(const char* name){
+    size_t path_len = strlen("binfuncs/") + strlen(name) + strlen(".bin") + 1;
+    char* path = malloc(path_len);
+    if(!path) return NULL;
 
-// --- Load function binary ---
-static void* load_func(const char* name) {
-    char path[256];
-    snprintf(path,sizeof(path),"binfuncs/%s.bin",name);
-    FILE* f = fopen(path,"rb");
+    sprintf(path, "binfuncs/%s.bin", name);
+
+    FILE* f = fopen(path, "rb");
+    free(path);  // free immediately after fopen
     if(!f) return NULL;
-    fseek(f,0,SEEK_END);
+
+    fseek(f, 0, SEEK_END);
     long len = ftell(f);
-    fseek(f,0,SEEK_SET);
-    void* buf = mmap(NULL,len,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    fread(buf,1,len,f);
+    fseek(f, 0, SEEK_SET);
+
+    void* buf = mmap(NULL, len, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(!buf) { fclose(f); return NULL; }
+
+    fread(buf, 1, len, f);
     fclose(f);
     return buf;
 }
 
-// --- Determine type of literal ---
-static Var* parse_literal(const char* token) {
-    if(strcmp(token,"null")==0) return var_null();
-    if(strcmp(token,"true")==0) return var_bool(1);
-    if(strcmp(token,"false")==0) return var_bool(0);
-    char* endptr;
-    long long i = strtoll(token,&endptr,10);
-    if(*endptr=='\0') return var_int(i);
-    double f = strtod(token,&endptr);
-    if(*endptr=='\0') return var_float(f);
-    return var_string(token); // treat as string literal
-}
-
-// --- Parse and execute a single statement ---
-static void execute_statement(Env* env, char* stmt) {
+// --- Execute a single statement ---
+static void execute_statement(Env* env, char* stmt){
     // Remove comments
     char* comment = strstr(stmt,"--");
     if(comment) *comment='\0';
@@ -117,41 +99,52 @@ static void execute_statement(Env* env, char* stmt) {
 
     // Split lhs and rhs
     char* eq = strchr(start,'=');
-    if(!eq) return; // invalid
+    if(!eq) return;  // invalid
     *eq='\0';
     char* lhs = start;
     char* rhs = eq+1;
     while(isspace(*lhs)) lhs++;
     while(isspace(*rhs)) rhs++;
 
+    // Dynamically copy lhs (variable name)
+    char* varname = strdup(lhs);
+    if(!varname) return;
+
     // Parse function name
     char* paren = strchr(rhs,'(');
-    if(!paren) return; // invalid
-    *paren = '\0';
-    char* funcname = rhs;
+    if(!paren) { free(varname); return; }  // invalid
+    *paren='\0';
+    char* funcname = strdup(rhs);
+    if(!funcname) { free(varname); return; }
     while(isspace(*funcname)) funcname++;
 
-    // Parse arguments string
+    // Parse argument string
     char* args_str = paren+1;
     char* close = strrchr(args_str,')');
-    if(!close) return;
+    if(!close) { free(varname); free(funcname); return; }
     *close='\0';
 
-    // Dynamic argument array
+    // Collect arguments dynamically
     int argc = 0;
     int capacity = 4;
-    Var** argv = malloc(capacity * sizeof(Var*));
+    Var** argv = malloc(capacity*sizeof(Var*));
+    if(!argv){ free(varname); free(funcname); return; }
 
     char* token = strtok(args_str,",");
     while(token){
         while(isspace(*token)) token++;
-        if(*token=='\0') { token = strtok(NULL,","); continue; }
+        if(*token=='\0'){ token = strtok(NULL,","); continue; }
 
-        Var* v = env_get(env, token); // try variable
-        if(!v) v = parse_literal(token); // else literal
+        Var* v = env_get(env, token);  // check variable first
+        if(!v){  // if not, create opaque literal
+            v = malloc(sizeof(Var));
+            if(!v) continue;
+            v->type = TYPE_OBJ;
+            v->data = strdup(token);  // store literal as string
+        }
         argv[argc++] = v;
 
-        if(argc>=capacity){
+        if(argc >= capacity){
             capacity *= 2;
             argv = realloc(argv, capacity*sizeof(Var*));
         }
@@ -161,14 +154,27 @@ static void execute_statement(Env* env, char* stmt) {
 
     // Load function dynamically
     varfunc_t f = (varfunc_t)load_func(funcname);
-    if(!f){ printf("Error: function %s not found\n", funcname); free(argv); return; }
+    if(!f){
+        printf("Error: function %s not found\n", funcname); 
+        for(int i=0;i<argc;i++){ if(argv[i]->data) free(argv[i]->data); free(argv[i]); }
+        free(argv); free(varname); free(funcname); 
+        return; 
+    }
 
-    Var* res = f(argv,argc);
-    env_set(env,lhs,res);
+    Var* res = f(argv, argc);
+    env_set(env, varname, res);
 
+    // Free temporary literals (not variables from env)
+    for(int i=0;i<argc;i++){
+        if(argv[i]->data) free(argv[i]->data);
+        free(argv[i]);
+    }
     free(argv);
+    free(varname);
+    free(funcname);
 }
 
+// --- Main ---
 int main(int argc,char** argv){
     if(argc<2){ printf("Usage: %s file.optivar\n",argv[0]); return 1; }
 
@@ -176,12 +182,14 @@ int main(int argc,char** argv){
     env_init(&env);
 
     FILE* f = fopen(argv[1],"r");
-    if(!f) { perror("fopen"); return 1; }
+    if(!f){ perror("fopen"); return 1; }
     fseek(f,0,SEEK_END);
     long len = ftell(f);
     fseek(f,0,SEEK_SET);
     char* buf = malloc(len+1);
-    fread(buf,1,len,f); fclose(f); buf[len]='\0';
+    fread(buf,1,len,f);
+    fclose(f);
+    buf[len]='\0';
 
     // Split statements by ';'
     char* stmt = strtok(buf,";");
