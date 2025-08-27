@@ -1,4 +1,4 @@
-/* universal_debugger.c
+/* debugger.c
  *
  * Universal interactive debugger for Optivar orchestrator:
  *  - parses .optivar files
@@ -8,10 +8,10 @@
  *  - writes optimized .optivar with slot assignments
  *
  * Compile:
- *   gcc -std=c11 -O2 -o universal_debugger universal_debugger.c
+ *   gcc -std=c11 -O2 -o debugger debugger.c
  *
  * Usage:
- *   ./universal_debugger src.optivar dst.optivar
+ *   ./debugger src.optivar dst.optivar
  */
 
 #define _GNU_SOURCE
