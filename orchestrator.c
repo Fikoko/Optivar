@@ -1,4 +1,4 @@
-// orchestrator.c - high-performance Optivar interpreter with preloaded binaries
+// orchestrator_optimized.c - High-performance Optivar interpreter
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,7 +7,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdint.h>
-#include <dirent.h>
+
+#define MAX_VARS 1024
+#define MAX_ARGS 8
 
 // ---------------- Types ----------------
 typedef enum { TYPE_OBJ } VarType;
@@ -25,66 +27,29 @@ typedef struct {
 } VarPool;
 
 static VarPool var_pool;
-
 static void pool_init() { var_pool.top = 0; }
 static Var* pool_alloc() {
-    if(var_pool.top < POOL_SIZE) return &var_pool.pool[var_pool.top++];
+    if (var_pool.top < POOL_SIZE) return &var_pool.pool[var_pool.top++];
     return malloc(sizeof(Var));
 }
 static void pool_reset() { var_pool.top = 0; }
 
-// ---------------- Hash Table Environment ----------------
-typedef struct EnvEntry {
-    char* name;
-    Var* value;
-    struct EnvEntry* next;
-} EnvEntry;
+// ---------------- Environment ----------------
+static Var* env_array[MAX_VARS];
+static int var_count = 0;
 
-#define ENV_BUCKETS 1024
-typedef struct {
-    EnvEntry* buckets[ENV_BUCKETS];
-} Env;
+// Map variable name to index
+static int var_index(const char* name) {
+    for (int i = 0; i < var_count; i++)
+        if (env_array[i] && env_array[i]->data && strcmp((char*)env_array[i]->data, name) == 0)
+            return i;
 
-static unsigned long hash(const char* str){
-    unsigned long h = 5381;
-    while(*str) h = ((h << 5) + h) + (unsigned char)(*str++);
-    return h % ENV_BUCKETS;
-}
-
-static void env_init(Env* e){ memset(e->buckets, 0, sizeof(e->buckets)); }
-
-static Var* env_get(Env* e, const char* name){
-    unsigned long h = hash(name);
-    EnvEntry* cur = e->buckets[h];
-    while(cur){
-        if(strcmp(cur->name,name)==0) return cur->value;
-        cur = cur->next;
-    }
-    return NULL;
-}
-
-static void env_set(Env* e, const char* name, Var* val){
-    unsigned long h = hash(name);
-    EnvEntry* cur = e->buckets[h];
-    while(cur){
-        if(strcmp(cur->name,name)==0){ cur->value=val; return; }
-        cur = cur->next;
-    }
-    EnvEntry* ne = malloc(sizeof(EnvEntry));
-    ne->name = strdup(name); ne->value = val;
-    ne->next = e->buckets[h]; e->buckets[h] = ne;
-}
-
-static void env_free(Env* e){
-    for(int i=0;i<ENV_BUCKETS;i++){
-        EnvEntry* cur = e->buckets[i];
-        while(cur){
-            EnvEntry* next = cur->next;
-            free(cur->name);
-            free(cur);
-            cur = next;
-        }
-    }
+    if (var_count >= MAX_VARS) { fprintf(stderr, "Too many variables\n"); exit(1); }
+    Var* v = pool_alloc();
+    v->type = TYPE_OBJ;
+    v->data = strdup(name);
+    env_array[var_count] = v;
+    return var_count++;
 }
 
 // ---------------- Binary Function Caching ----------------
@@ -116,7 +81,6 @@ static varfunc_t load_func(const char* name){
     if(fread(buf,1,len,f)!=len){ fclose(f); munmap(buf,len); return NULL; }
     fclose(f);
 
-    // Store in cache
     if(func_cache_count>=func_cache_capacity){
         func_cache_capacity = func_cache_capacity ? func_cache_capacity*2:8;
         func_cache = realloc(func_cache,sizeof(FuncCache)*func_cache_capacity);
@@ -138,28 +102,11 @@ static void free_func_cache(){
     free(func_cache);
 }
 
-// ---------------- Preload all binaries ----------------
-static void preload_binaries(const char* dir) {
-    DIR* d = opendir(dir);
-    if(!d) { perror("opendir"); return; }
-
-    struct dirent* entry;
-    while((entry = readdir(d)) != NULL) {
-        size_t len = strlen(entry->d_name);
-        if(len > 4 && strcmp(entry->d_name + len - 4, ".bin") == 0) {
-            char func_name[256];
-            snprintf(func_name, sizeof(func_name), "%.*s", (int)(len - 4), entry->d_name);
-            load_func(func_name);
-        }
-    }
-    closedir(d);
-}
-
-// ---------------- Intermediate Representation ----------------
+// ---------------- IR ----------------
 typedef struct IRStmt {
-    char* lhs;
+    int lhs_index;
     char* funcname;
-    char** arg_tokens;
+    int* arg_indices;
     int argc;
 } IRStmt;
 
@@ -170,7 +117,6 @@ typedef struct IR {
 } IR;
 
 static void ir_init(IR* ir){ ir->stmts=NULL; ir->count=ir->capacity=0; }
-
 static void ir_add(IR* ir, IRStmt s){
     if(ir->count>=ir->capacity){
         ir->capacity = ir->capacity ? ir->capacity*2:8;
@@ -181,11 +127,8 @@ static void ir_add(IR* ir, IRStmt s){
 
 static void ir_free(IR* ir){
     for(int i=0;i<ir->count;i++){
-        free(ir->stmts[i].lhs);
         free(ir->stmts[i].funcname);
-        for(int j=0;j<ir->stmts[i].argc;j++)
-            free(ir->stmts[i].arg_tokens[j]);
-        free(ir->stmts[i].arg_tokens);
+        free(ir->stmts[i].arg_indices);
     }
     free(ir->stmts);
 }
@@ -199,7 +142,7 @@ static IRStmt parse_statement(char* stmt){
 
     char* eq = strchr(stmt,'='); if(!eq) return s;
     *eq='\0';
-    s.lhs = strdup(stmt); while(isspace(*s.lhs)) s.lhs++;
+    s.lhs_index = var_index(stmt);
     char* rhs = eq+1; while(isspace(*rhs)) rhs++;
     char* paren = strchr(rhs,'('); if(!paren) return s;
     *paren='\0';
@@ -208,50 +151,48 @@ static IRStmt parse_statement(char* stmt){
     char* close = strrchr(args_str,')'); if(!close) return s;
     *close='\0';
 
-    s.arg_tokens=NULL; s.argc=0; int cap=4;
-    s.arg_tokens = malloc(sizeof(char*)*cap);
+    int cap = 4; s.arg_indices = malloc(sizeof(int)*cap); s.argc=0;
     char* token = strtok(args_str,",");
     while(token){
         while(isspace(*token)) token++;
         if(*token=='\0'){ token=strtok(NULL,","); continue; }
-        if(s.argc>=cap){ cap*=2; s.arg_tokens=realloc(s.arg_tokens,sizeof(char*)*cap); }
-        s.arg_tokens[s.argc++] = strdup(token);
+        if(s.argc>=cap){ cap*=2; s.arg_indices=realloc(s.arg_indices,sizeof(int)*cap); }
+        s.arg_indices[s.argc++] = var_index(token);
         token=strtok(NULL,",");
     }
     return s;
 }
 
 // ---------------- Execute IR Statement ----------------
-static void execute_ir(IRStmt* s, Env* env){
-    if(!s->lhs || !s->funcname) return;
+static void execute_ir(IRStmt* s){
+    if(!s->funcname) return;
 
-    int argc = s->argc; Var** argv = malloc(sizeof(Var*)*argc);
-    for(int i=0;i<argc;i++){
-        Var* v = env_get(env,s->arg_tokens[i]);
-        if(!v){
-            v = pool_alloc(); v->type=TYPE_OBJ;
-            v->data = strdup(s->arg_tokens[i]);
-        }
-        argv[i]=v;
+    Var* argv[MAX_ARGS];
+    Var** argv_extra = NULL;
+
+    if(s->argc <= MAX_ARGS){
+        for(int i=0;i<s->argc;i++)
+            argv[i] = env_array[s->arg_indices[i]];
+    } else {
+        argv_extra = malloc(sizeof(Var*)*s->argc);
+        for(int i=0;i<s->argc;i++)
+            argv_extra[i] = env_array[s->arg_indices[i]];
     }
 
     varfunc_t f = load_func(s->funcname);
-    if(!f){ printf("Error: %s not found\n", s->funcname); free(argv); return; }
+    if(!f){ printf("Error: %s not found\n", s->funcname); if(argv_extra) free(argv_extra); return; }
 
-    Var* res = f(argv,argc);
-    env_set(env,s->lhs,res);
-    free(argv);
+    Var* res = f(argv_extra ? argv_extra : argv, s->argc);
+    env_array[s->lhs_index] = res;
+
+    if(argv_extra) free(argv_extra);
 }
 
 // ---------------- Main ----------------
 int main(int argc,char** argv){
     if(argc<2){ printf("Usage: %s file.optivar\n",argv[0]); return 1; }
 
-    Env env; env_init(&env);
     pool_init();
-
-    // Preload all binaries in binfuncs/
-    preload_binaries("binfuncs");
 
     FILE* f = fopen(argv[1],"r"); if(!f){ perror("fopen"); return 1; }
     fseek(f,0,SEEK_END); long len = ftell(f); fseek(f,0,SEEK_SET);
@@ -263,12 +204,12 @@ int main(int argc,char** argv){
     free(buf);
 
     for(int i=0;i<ir.count;i++){
-        execute_ir(&ir.stmts[i],&env);
-        pool_reset(); // reuse object pool
+        execute_ir(&ir.stmts[i]);
+        pool_reset();
     }
 
     ir_free(&ir);
-    env_free(&env);
     free_func_cache();
 
-    return 0
+    return 0;
+}
