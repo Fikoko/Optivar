@@ -1,6 +1,6 @@
 
 # Ɵ-Programming-Language
-Ɵ (Optivar) is an Declarative Intermediate Language (DIL) designed for prioritizing simplicity and performance through defining variables and using a comprehensive library of pre-defined, highly optimized functions. 
+Ɵ (Optivar) is an Declarative Intermediate Language (DIL) designed for prioritizing simplicity and performance through defining variables/arguments and using a comprehensive library of pre-defined, highly optimized functions. 
 
 ## Description
 
@@ -8,7 +8,7 @@ This is essentially a “modular, plugin-based scripting language”: the core i
 
 This programming language is created mainly to leave the manual function creation (operators such as additions, substractions, loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via a minimalist turing complete instruction list (command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP") depending on "hardware infrastructure". 
 
-So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables.
+So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables/arguments.
 
 Whole programming language has only 2 syntax structure:
 
@@ -17,7 +17,7 @@ Whole programming language has only 2 syntax structure:
 
 For simplicity, it is translated to natural language as:
 
-"make functional translation f of variables/arguments x1, x2 , x3 ... as equivalent of the output y1"
+"make functional translation f of inputs (variables/arguments) x1, x2 , x3 ... as equivalent of the output (variable/argument) y1"
 
 ## Getting Started
 
