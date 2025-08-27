@@ -1,4 +1,4 @@
-// orchestrator.c - 
+// orchestrator.c - high-performance Optivar interpreter with preloaded binaries
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <dirent.h>
 
 // ---------------- Types ----------------
 typedef enum { TYPE_OBJ } VarType;
@@ -137,6 +138,23 @@ static void free_func_cache(){
     free(func_cache);
 }
 
+// ---------------- Preload all binaries ----------------
+static void preload_binaries(const char* dir) {
+    DIR* d = opendir(dir);
+    if(!d) { perror("opendir"); return; }
+
+    struct dirent* entry;
+    while((entry = readdir(d)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if(len > 4 && strcmp(entry->d_name + len - 4, ".bin") == 0) {
+            char func_name[256];
+            snprintf(func_name, sizeof(func_name), "%.*s", (int)(len - 4), entry->d_name);
+            load_func(func_name);
+        }
+    }
+    closedir(d);
+}
+
 // ---------------- Intermediate Representation ----------------
 typedef struct IRStmt {
     char* lhs;
@@ -232,6 +250,9 @@ int main(int argc,char** argv){
     Env env; env_init(&env);
     pool_init();
 
+    // Preload all binaries in binfuncs/
+    preload_binaries("binfuncs");
+
     FILE* f = fopen(argv[1],"r"); if(!f){ perror("fopen"); return 1; }
     fseek(f,0,SEEK_END); long len = ftell(f); fseek(f,0,SEEK_SET);
     char* buf = malloc(len+1); fread(buf,1,len,f); fclose(f); buf[len]='\0';
@@ -243,12 +264,11 @@ int main(int argc,char** argv){
 
     for(int i=0;i<ir.count;i++){
         execute_ir(&ir.stmts[i],&env);
-        pool_reset();
+        pool_reset(); // reuse object pool
     }
 
     ir_free(&ir);
     env_free(&env);
     free_func_cache();
 
-    return 0;
-}
+    return 0
