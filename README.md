@@ -6,7 +6,7 @@
 
 This is essentially a “modular, plugin-based scripting language”: the core is tiny and stable, and all language features are optional binaries provided as a package. Users only get what they need, and the heavy lifting is done natively.
 
-This programming language is created mainly in order to leave the manual function creation (operators such as additions, substractions, loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via a minimalist turing complete instruction list (command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP") depending on "hardware infrastructure". 
+This programming language is created mainly to leave the manual function creation (operators such as additions, substractions, loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via a minimalist turing complete instruction list (command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP") depending on "hardware infrastructure". 
 
 So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables.
 
