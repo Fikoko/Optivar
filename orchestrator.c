@@ -5,7 +5,7 @@
 //   gcc -std=c11 -O2 -Wall orchestrator.c -o orchestrator
 //
 // Usage:
-//   ./orchestrator program.optv
+//   ./orchestrator program.optivar
 //
 // Notes:
 // - Binary functions must follow the ABI: Var* func(Var** args, int count)
@@ -37,7 +37,7 @@ typedef enum {
 } VarType;
 
 typedef struct Var {
-    char* name;      // optional name (NULL for anonymous values)
+    char* name;
     VarType type;
     union {
         long long i_val;
@@ -55,7 +55,7 @@ typedef struct Var {
             int count;
             int capacity;
         } object;
-        void* func_ptr; // raw pointer for function references
+        void* func_ptr;
     } data;
 } Var;
 
@@ -208,17 +208,12 @@ static Var* env_get(Env* e, const char* name) {
     return NULL;
 }
 
-// Inserts or replaces; takes ownership of value (value should be heap-allocated)
 static void env_set(Env* e, const char* name, Var* value) {
     if(!name || !value) return;
     Var* existing = env_get(e, name);
     if(existing) {
-        // replace
-        if(existing->type == TYPE_STRING && existing->data.s_val) { /* freed by var_free */ }
         var_free(existing);
-        // put new value in same slot
         value->name = strdup_safe(name);
-        // replace pointer in array
         for(int i=0;i<e->count;i++) {
             if(e->vars[i] && e->vars[i]->name && strcmp(e->vars[i]->name, name) == 0) {
                 e->vars[i] = value;
@@ -227,7 +222,6 @@ static void env_set(Env* e, const char* name, Var* value) {
         }
     }
 
-    // append
     if(e->count >= e->capacity) {
         e->capacity = e->capacity ? e->capacity * 2 : 8;
         e->vars = realloc(e->vars, e->capacity * sizeof(Var*));
@@ -246,8 +240,6 @@ static void env_free(Env* e) {
 }
 
 // ---- Printing ----
-static void print_var(const Var* v);
-
 static void print_var(const Var* v) {
     if(!v) { printf("null"); return; }
     switch(v->type) {
@@ -280,23 +272,16 @@ static void print_var(const Var* v) {
 // ---- Binary loader and cache ----
 static void* load_binary_nocache(const char* path, size_t* out_size) {
     FILE* f = fopen(path, "rb");
-    if(!f) {
-        // perror intentionally deferred to caller
-        return NULL;
-    }
+    if(!f) return NULL;
     if(fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long len = ftell(f);
     if(len < 0) { fclose(f); return NULL; }
     fseek(f, 0, SEEK_SET);
-    // allocate executable mmap
     void* buffer = mmap(NULL, len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if(buffer == MAP_FAILED) { fclose(f); return NULL; }
     size_t nread = fread(buffer, 1, len, f);
     fclose(f);
-    if(nread != (size_t)len) {
-        munmap(buffer, len);
-        return NULL;
-    }
+    if(nread != (size_t)len) { munmap(buffer, len); return NULL; }
     *out_size = len;
     return buffer;
 }
@@ -325,9 +310,7 @@ static void* cache_get(const char* name, size_t* out_size) {
 
 static void cache_cleanup() {
     for(int i=0;i<func_cache_count;i++) {
-        if(func_cache[i].ptr && func_cache[i].size > 0) {
-            munmap(func_cache[i].ptr, func_cache[i].size);
-        }
+        if(func_cache[i].ptr && func_cache[i].size > 0) munmap(func_cache[i].ptr, func_cache[i].size);
         free(func_cache[i].name);
     }
     free(func_cache);
@@ -335,7 +318,6 @@ static void cache_cleanup() {
     func_cache_count = func_cache_capacity = 0;
 }
 
-// Function ABI: Var* func(Var** args, int count)
 typedef Var* (*varfunc_t)(Var** args, int count);
 
 static Var* execute_func(Env* env, const char* func_name, Var** args, int arg_count) {
@@ -355,11 +337,8 @@ static Var* execute_func(Env* env, const char* func_name, Var** args, int arg_co
 
     varfunc_t f = (varfunc_t)fptr;
     Var* res = f(args, arg_count);
-    if(!res) {
-        // treat as null result
-        return var_null();
-    }
-    return res; // ownership to caller
+    if(!res) return var_null();
+    return res;
 }
 
 // ---- Parsing literals and args ----
@@ -368,10 +347,7 @@ static int is_integer_literal(const char* s) {
     const char* p = s;
     if(*p == '+' || *p == '-') p++;
     if(!isdigit((unsigned char)*p)) return 0;
-    while(*p) {
-        if(!isdigit((unsigned char)*p)) return 0;
-        p++;
-    }
+    while(*p) { if(!isdigit((unsigned char)*p)) return 0; p++; }
     return 1;
 }
 
@@ -382,59 +358,39 @@ static int looks_like_float(const char* s) {
     if(*p == '+' || *p == '-') p++;
     int digits = 0;
     while(*p) {
-        if(*p == '.') {
-            if(dot) return 0;
-            dot = 1;
-        } else if(isdigit((unsigned char)*p)) {
-            digits = 1;
-        } else return 0;
+        if(*p == '.') { if(dot) return 0; dot = 1; }
+        else if(isdigit((unsigned char)*p)) digits = 1;
+        else return 0;
         p++;
     }
     return dot && digits;
 }
 
-// parse token into a heap-allocated Var*.
-// If token is a variable name, resolve from env and return a clone of the env var (so functions can mutate safely).
 static Var* parse_token_to_var(Env* env, char* token) {
     char* t = strtrim(token);
     int len = t ? strlen(t) : 0;
     if(!t || len == 0) return var_null();
 
-    // quoted string
     if(t[0] == '"' && t[len-1] == '"' && len >= 2) {
-        // remove quotes inside
         char tmp[len-1];
         memcpy(tmp, t+1, len-2);
         tmp[len-2] = '\0';
         return var_from_string(tmp);
     }
 
-    // booleans/null
     if(strcmp(t, "true") == 0) return var_from_bool(1);
     if(strcmp(t, "false") == 0) return var_from_bool(0);
     if(strcmp(t, "null") == 0) return var_null();
 
-    // integers and floats
-    if(is_integer_literal(t)) {
-        long long vv = atoll(t);
-        return var_from_int(vv);
-    }
-    if(looks_like_float(t)) {
-        double vf = atof(t);
-        return var_from_float(vf);
-    }
+    if(is_integer_literal(t)) return var_from_int(atoll(t));
+    if(looks_like_float(t)) return var_from_float(atof(t));
 
-    // otherwise treat as variable name: look up in env
     Var* found = env_get(env, t);
-    if(found) {
-        return var_clone(found);
-    } else {
-        fprintf(stderr, "Warning: variable '%s' not found; using null\n", t);
-        return var_null();
-    }
+    if(found) return var_clone(found);
+    fprintf(stderr, "Warning: variable '%s' not found in .optivar; using null\n", t);
+    return var_null();
 }
 
-// split args string by commas (handles simple cases; does not parse nested arrays/objects)
 static Var** parse_args(Env* env, char* argstr, int* out_count) {
     Var** args = NULL;
     int count = 0;
@@ -445,11 +401,7 @@ static Var** parse_args(Env* env, char* argstr, int* out_count) {
     char* token = strtok_r(argstr, ",", &saveptr);
     while(token) {
         Var* v = parse_token_to_var(env, token);
-        if(count >= cap) {
-            cap = cap ? cap * 2 : 8;
-            args = realloc(args, cap * sizeof(Var*));
-            if(!args) { perror("realloc"); exit(1); }
-        }
+        if(count >= cap) { cap = cap ? cap * 2 : 8; args = realloc(args, cap * sizeof(Var*)); if(!args) { perror("realloc"); exit(1); } }
         args[count++] = v;
         token = strtok_r(NULL, ",", &saveptr);
     }
@@ -472,25 +424,21 @@ static void run_program(const char* filename, Env* env) {
     fclose(f);
     buf[r] = '\0';
 
-    // split by ';'
     char* saveptr = NULL;
     char* stmt = strtok_r(buf, ";", &saveptr);
     while(stmt) {
         char* s = strtrim(stmt);
         if(!s || strlen(s) == 0) { stmt = strtok_r(NULL, ";", &saveptr); continue; }
 
-        // find '=' separator
         char* eq = strchr(s, '=');
         if(!eq) {
-            fprintf(stderr, "Parse error: statement missing '=' -> '%s'\n", s);
+            fprintf(stderr, "Parse error in .optivar: missing '=' -> '%s'\n", s);
             stmt = strtok_r(NULL, ";", &saveptr); continue;
         }
         *eq = '\0';
         char* lhs = strtrim(s);
         char* rhs = strtrim(eq + 1);
 
-        // parse rhs as func(args) or literal
-        // check for func(...). find '('
         char* popen = strchr(rhs, '(');
         char* pclose = NULL;
         char funcname[256];
@@ -499,41 +447,32 @@ static void run_program(const char* filename, Env* env) {
         if(popen) {
             pclose = strrchr(rhs, ')');
             if(!pclose) {
-                fprintf(stderr, "Parse error: missing ')' in '%s'\n", rhs);
+                fprintf(stderr, "Parse error in .optivar: missing ')' -> '%s'\n", rhs);
                 stmt = strtok_r(NULL, ";", &saveptr); continue;
             }
-            // func name is substring before '('
             int fname_len = popen - rhs;
             if(fname_len >= (int)sizeof(funcname)) fname_len = sizeof(funcname)-1;
             strncpy(funcname, rhs, fname_len);
             funcname[fname_len] = '\0';
             strtrim(funcname);
 
-            // args substring
             int alen = pclose - (popen + 1);
             args_str = malloc(alen + 1);
             if(!args_str) { perror("malloc"); exit(1); }
             memcpy(args_str, popen + 1, alen);
             args_str[alen] = '\0';
         } else {
-            // rhs is literal or variable -> assign directly
             Var* v = parse_token_to_var(env, rhs);
             env_set(env, lhs, v);
             stmt = strtok_r(NULL, ";", &saveptr);
             continue;
         }
 
-        // parse args into Var**
         int arg_count = 0;
         Var** args = parse_args(env, args_str, &arg_count);
-
-        // execute function
         Var* result = execute_func(env, funcname, args, arg_count);
-
-        // store result in environment (take ownership)
         env_set(env, lhs, result);
 
-        // cleanup args list (they were clones/heap allocated)
         for(int i=0;i<arg_count;i++) var_free(args[i]);
         free(args);
         free(args_str);
@@ -547,18 +486,17 @@ static void run_program(const char* filename, Env* env) {
 // ---- Main ----
 int main(int argc, char** argv) {
     if(argc < 2) {
-        fprintf(stderr, "Usage: %s file.optv\n", argv[0]);
+        fprintf(stderr, "Usage: %s file.optivar\n", argv[0]);
         return 1;
     }
-
     Env env;
     env_init(&env);
 
     run_program(argv[1], &env);
 
-    printf("Environment:\n");
+    // Optional: print all variables after execution
     for(int i=0;i<env.count;i++) {
-        printf("%s = ", env.vars[i]->name ? env.vars[i]->name : "(anon)");
+        printf("%s = ", env.vars[i]->name);
         print_var(env.vars[i]);
         printf("\n");
     }
