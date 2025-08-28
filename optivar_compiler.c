@@ -9,95 +9,93 @@
 
 #define MAX_VARS 1024
 #define POOL_SIZE 1024
-#define FUNC_HASH_SIZE 256
 #define MAX_IR 8192
 #define ARG_POOL_SIZE 65536
-#define VAR_HASH_SIZE 4096
 
 // ---------------- Types ----------------
 typedef struct Var { void* data; } Var;
 
 // ---------------- Object Pool ----------------
 static Var var_pool[POOL_SIZE];
-static int pool_top = 0;
-static Var* pool_alloc() { return (pool_top < POOL_SIZE) ? &var_pool[pool_top++] : malloc(sizeof(Var)); }
-static void pool_reset() { pool_top = 0; }
+static int pool_top=0;
+static Var* pool_alloc(){ return (pool_top<POOL_SIZE)?&var_pool[pool_top++]:malloc(sizeof(Var)); }
+static void pool_reset(){ pool_top=0; }
 
 // ---------------- Variable Environment ----------------
 static Var* env_array[MAX_VARS];
-static int var_count = 0;
+static int var_count=0;
 
-// ---------------- String Interning / Variable Hash ----------------
-typedef struct VarEntry { char* name; int index; struct VarEntry* next; } VarEntry;
-static VarEntry* var_hash[VAR_HASH_SIZE];
-
-static unsigned int hash_string(const char* s){
-    unsigned int h=5381; while(*s) h=((h<<5)+h)+(unsigned char)(*s++);
-    return h%VAR_HASH_SIZE;
-}
+// ---------------- String Interning ----------------
+static char* var_intern[MAX_VARS];
+static int var_hash[MAX_VARS]; // simple linear probing
 
 static int var_index(const char* name){
-    unsigned int h=hash_string(name);
-    VarEntry* e=var_hash[h];
-    while(e){ if(e->name==name || strcmp(e->name,name)==0) return e->index; e=e->next; }
-
-    if(var_count>=MAX_VARS){ fprintf(stderr,"Too many variables\n"); exit(1); }
-    Var* v = pool_alloc(); v->data = strdup(name); env_array[var_count] = v;
-
-    VarEntry* ne = malloc(sizeof(VarEntry));
-    ne->name = v->data; ne->index = var_count; ne->next = var_hash[h]; var_hash[h] = ne;
-
+    for(int i=0;i<var_count;i++)
+        if(var_intern[i]==name || strcmp(var_intern[i],name)==0) return i;
+    Var* v=pool_alloc(); v->data=(void*)name; env_array[var_count]=v;
+    var_intern[var_count]=name;
     return var_count++;
 }
 
-// ---------------- Binary Function Cache ----------------
-typedef Var* (*varfunc_t)(Var** args,int argc);
-typedef struct FuncEntry { char* name; varfunc_t func; void* buf; size_t len; struct FuncEntry* next; } FuncEntry;
-static FuncEntry* func_hash[FUNC_HASH_SIZE];
-
-static unsigned int hash_funcname(const char* s){
-    unsigned int h=5381; while(*s) h=((h<<5)+h)+(unsigned char)(*s++);
-    return h%FUNC_HASH_SIZE;
-}
-
-static void insert_func(FuncEntry* f){ unsigned int h=hash_funcname(f->name); f->next=func_hash[h]; func_hash[h]=f; }
-static varfunc_t get_func(const char* name){ unsigned int h=hash_funcname(name); FuncEntry* e=func_hash[h]; while(e){ if(strcmp(e->name,name)==0) return e->func; e=e->next; } return NULL; }
+// ---------------- Binary Function Blob ----------------
+typedef struct { char* name; void* ptr; size_t len; size_t offset; } FuncEntry;
+static FuncEntry func_table[256];
+static int func_count=0;
+static char* func_blob=NULL;
+static size_t blob_size=0;
 
 static void preload_binfuncs(const char* dirpath){
     DIR* dir=opendir(dirpath); if(!dir){ perror("opendir"); return; }
-    struct dirent* entry;
+    struct dirent* entry; size_t total_size=0;
+
+    // Calculate total size
+    while((entry=readdir(dir))!=NULL){
+        if(entry->d_type==DT_REG){
+            char* name=entry->d_name; size_t len=strlen(name);
+            if(len>4 && strcmp(name+len-4,".bin")==0){
+                char path[256]; snprintf(path,sizeof(path),"%s/%s",dirpath,name);
+                FILE* f=fopen(path,"rb"); if(!f){ perror(path); continue; }
+                fseek(f,0,SEEK_END); long flen=ftell(f); fseek(f,0,SEEK_SET);
+                total_size+=flen;
+                fclose(f);
+            }
+        }
+    }
+    // mmap single blob
+    func_blob=mmap(NULL,total_size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(!func_blob){ perror("mmap blob"); return; }
+
+    // Load functions
+    size_t offset=0;
+    rewinddir(dir);
     while((entry=readdir(dir))!=NULL){
         if(entry->d_type==DT_REG){
             char* name=entry->d_name; size_t len=strlen(name);
             if(len>4 && strcmp(name+len-4,".bin")==0){
                 char funcname[256]; strncpy(funcname,name,len-4); funcname[len-4]='\0';
-                char path[256]; snprintf(path,sizeof(path),"%s/%s.bin",dirpath,funcname);
+                char path[256]; snprintf(path,sizeof(path),"%s/%s",dirpath,name);
                 FILE* f=fopen(path,"rb"); if(!f){ perror(path); continue; }
                 fseek(f,0,SEEK_END); long flen=ftell(f); fseek(f,0,SEEK_SET);
-                void* buf=mmap(NULL,flen,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-                if(!buf){ fclose(f); perror("mmap"); continue; }
-                if(fread(buf,1,flen,f)!=flen){ fclose(f); munmap(buf,flen); continue; }
-                fclose(f);
+                fread(func_blob+offset,1,flen,f); fclose(f);
 
-                FuncEntry* fe=malloc(sizeof(FuncEntry));
-                fe->name=strdup(funcname); fe->func=(varfunc_t)buf; fe->buf=buf; fe->len=flen; fe->next=NULL;
-                insert_func(fe);
+                func_table[func_count].name=strdup(funcname);
+                func_table[func_count].ptr=(void*)(func_blob+offset);
+                func_table[func_count].len=flen;
+                func_table[func_count].offset=offset;
+                offset+=flen; func_count++;
             }
         }
     }
-    closedir(dir);
+    closedir(dir); blob_size=offset;
 }
 
 static void free_func_table(){
-    for(int i=0;i<FUNC_HASH_SIZE;i++){
-        FuncEntry* e=func_hash[i];
-        while(e){ FuncEntry* tmp=e; e=e->next; free(tmp->name); if(tmp->buf&&tmp->len>0) munmap(tmp->buf,tmp->len); free(tmp); }
-        func_hash[i]=NULL;
-    }
+    for(int i=0;i<func_count;i++) free(func_table[i].name);
+    if(func_blob) munmap(func_blob,blob_size);
 }
 
 // ---------------- IR ----------------
-typedef struct IRStmt{ int lhs_index; varfunc_t func_ptr; int argc; int* arg_indices; } IRStmt;
+typedef struct IRStmt{ int lhs_index; void* func_ptr; int argc; int* arg_indices; } IRStmt;
 typedef struct IR{ IRStmt* stmts; int count; int capacity; } IR;
 static void ir_init(IR* ir){ ir->stmts=NULL; ir->count=ir->capacity=0; }
 static IRStmt* ir_alloc_stmt(IR* ir){ 
@@ -109,24 +107,21 @@ static IRStmt* ir_alloc_stmt(IR* ir){
 static int arg_pool[ARG_POOL_SIZE]; static int arg_top=0;
 static int* arg_alloc(int n){ if(arg_top+n>ARG_POOL_SIZE){ fprintf(stderr,"Arg pool full\n"); exit(1); } int* ptr=&arg_pool[arg_top]; arg_top+=n; return ptr; }
 
-// ---------------- Parsing (manual pointer scanning) ----------------
+// ---------------- Parsing ----------------
 static IRStmt parse_statement(char* stmt){
-    IRStmt s={0};
-    char* c=strstr(stmt,"--"); if(c)*c='\0';
+    IRStmt s={0}; char* c=strstr(stmt,"--"); if(c)*c='\0';
     while(isspace(*stmt)) stmt++; if(*stmt=='\0') return s;
 
-    // LHS
     char* eq=strchr(stmt,'='); if(!eq) return s; *eq='\0';
     s.lhs_index=var_index(stmt); char* rhs=eq+1; while(isspace(*rhs)) rhs++;
 
-    // Function name
-    char* paren=strchr(rhs,'('); if(!paren) return s; *paren='\0';
-    while(isspace(*rhs)) rhs++; s.func_ptr=get_func(rhs);
+    char* paren=strchr(rhs,'('); if(!paren) return s; *paren='\0'; while(isspace(*rhs)) rhs++;
+    // Resolve func pointer directly
+    for(int i=0;i<func_count;i++) if(strcmp(func_table[i].name,rhs)==0){ s.func_ptr=func_table[i].ptr; break; }
 
-    // Arguments
     char* args_str=paren+1; char* close=strrchr(args_str,')'); if(!close) return s; *close='\0';
-    s.arg_indices=arg_alloc(16); s.argc=0; // max 16 args per statement
-    char* p=args_str; while(*p){
+    s.arg_indices=arg_alloc(16); s.argc=0; char* p=args_str;
+    while(*p){
         while(isspace(*p)) p++; if(*p==',' || *p==')'){ p++; continue; }
         char* start=p; while(*p && *p!=',' && *p!=')') p++;
         if(p>start) s.arg_indices[s.argc++]=var_index(start);
