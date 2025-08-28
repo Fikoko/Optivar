@@ -10,70 +10,49 @@
 #define MAX_VARS 1024
 #define POOL_SIZE 1024
 #define FUNC_HASH_SIZE 256
+#define MAX_IR 8192
+#define ARG_POOL_SIZE 65536
+#define VAR_HASH_SIZE 4096
 
 // ---------------- Types ----------------
-typedef struct Var {
-    void* data;
-} Var;
+typedef struct Var { void* data; } Var;
 
 // ---------------- Object Pool ----------------
-typedef struct {
-    Var pool[POOL_SIZE];
-    int top;
-} VarPool;
+static Var var_pool[POOL_SIZE];
+static int pool_top = 0;
+static Var* pool_alloc() { return (pool_top < POOL_SIZE) ? &var_pool[pool_top++] : malloc(sizeof(Var)); }
+static void pool_reset() { pool_top = 0; }
 
-static VarPool var_pool;
-static void pool_init() { var_pool.top = 0; }
-static Var* pool_alloc() { 
-    if(var_pool.top<POOL_SIZE) return &var_pool.pool[var_pool.top++];
-    return malloc(sizeof(Var));
-}
-static void pool_reset() { var_pool.top=0; } // reset once at program end
-
-// ---------------- Environment ----------------
+// ---------------- Variable Environment ----------------
 static Var* env_array[MAX_VARS];
 static int var_count = 0;
 
-// ---------------- Variable Hash ----------------
-typedef struct VarEntry {
-    char* name;
-    int index;
-    struct VarEntry* next;
-} VarEntry;
-
-static VarEntry* var_hash[MAX_VARS*2];
+// ---------------- String Interning / Variable Hash ----------------
+typedef struct VarEntry { char* name; int index; struct VarEntry* next; } VarEntry;
+static VarEntry* var_hash[VAR_HASH_SIZE];
 
 static unsigned int hash_string(const char* s){
-    unsigned int h=5381;
-    while(*s) h=((h<<5)+h)+(unsigned char)(*s++);
-    return h%(MAX_VARS*2);
+    unsigned int h=5381; while(*s) h=((h<<5)+h)+(unsigned char)(*s++);
+    return h%VAR_HASH_SIZE;
 }
 
 static int var_index(const char* name){
     unsigned int h=hash_string(name);
     VarEntry* e=var_hash[h];
-    while(e){ if(strcmp(e->name,name)==0) return e->index; e=e->next; }
-    if(var_count>=MAX_VARS){ fprintf(stderr,"Too many variables\n"); exit(1); }
-    Var* v=pool_alloc(); v->data=strdup(name); env_array[var_count]=v;
+    while(e){ if(e->name==name || strcmp(e->name,name)==0) return e->index; e=e->next; }
 
-    VarEntry* ne=malloc(sizeof(VarEntry));
-    ne->name=(char*)v->data; ne->index=var_count; ne->next=var_hash[h];
-    var_hash[h]=ne;
+    if(var_count>=MAX_VARS){ fprintf(stderr,"Too many variables\n"); exit(1); }
+    Var* v = pool_alloc(); v->data = strdup(name); env_array[var_count] = v;
+
+    VarEntry* ne = malloc(sizeof(VarEntry));
+    ne->name = v->data; ne->index = var_count; ne->next = var_hash[h]; var_hash[h] = ne;
 
     return var_count++;
 }
 
 // ---------------- Binary Function Cache ----------------
 typedef Var* (*varfunc_t)(Var** args,int argc);
-
-typedef struct FuncEntry {
-    char* name;
-    varfunc_t func;
-    void* buf;
-    size_t len;
-    struct FuncEntry* next;
-} FuncEntry;
-
+typedef struct FuncEntry { char* name; varfunc_t func; void* buf; size_t len; struct FuncEntry* next; } FuncEntry;
 static FuncEntry* func_hash[FUNC_HASH_SIZE];
 
 static unsigned int hash_funcname(const char* s){
@@ -81,19 +60,11 @@ static unsigned int hash_funcname(const char* s){
     return h%FUNC_HASH_SIZE;
 }
 
-static void insert_func(FuncEntry* f){
-    unsigned int h=hash_funcname(f->name); f->next=func_hash[h]; func_hash[h]=f;
-}
-
-static varfunc_t get_func(const char* name){
-    unsigned int h=hash_funcname(name); FuncEntry* e=func_hash[h];
-    while(e){ if(strcmp(e->name,name)==0) return e->func; e=e->next; }
-    return NULL;
-}
+static void insert_func(FuncEntry* f){ unsigned int h=hash_funcname(f->name); f->next=func_hash[h]; func_hash[h]=f; }
+static varfunc_t get_func(const char* name){ unsigned int h=hash_funcname(name); FuncEntry* e=func_hash[h]; while(e){ if(strcmp(e->name,name)==0) return e->func; e=e->next; } return NULL; }
 
 static void preload_binfuncs(const char* dirpath){
-    DIR* dir=opendir(dirpath);
-    if(!dir){ perror("opendir"); return; }
+    DIR* dir=opendir(dirpath); if(!dir){ perror("opendir"); return; }
     struct dirent* entry;
     while((entry=readdir(dir))!=NULL){
         if(entry->d_type==DT_REG){
@@ -109,8 +80,7 @@ static void preload_binfuncs(const char* dirpath){
                 fclose(f);
 
                 FuncEntry* fe=malloc(sizeof(FuncEntry));
-                fe->name=strdup(funcname); fe->func=(varfunc_t)buf;
-                fe->buf=buf; fe->len=flen; fe->next=NULL;
+                fe->name=strdup(funcname); fe->func=(varfunc_t)buf; fe->buf=buf; fe->len=flen; fe->next=NULL;
                 insert_func(fe);
             }
         }
@@ -127,52 +97,40 @@ static void free_func_table(){
 }
 
 // ---------------- IR ----------------
-typedef struct IRStmt{
-    int lhs_index;
-    varfunc_t func_ptr;
-    int* arg_indices;
-    int argc;
-} IRStmt;
-
-typedef struct IR{
-    IRStmt* stmts;
-    int count;
-    int capacity;
-} IR;
-
+typedef struct IRStmt{ int lhs_index; varfunc_t func_ptr; int argc; int* arg_indices; } IRStmt;
+typedef struct IR{ IRStmt* stmts; int count; int capacity; } IR;
 static void ir_init(IR* ir){ ir->stmts=NULL; ir->count=ir->capacity=0; }
-static void ir_add(IR* ir,IRStmt s){ 
+static IRStmt* ir_alloc_stmt(IR* ir){ 
     if(ir->count>=ir->capacity){ ir->capacity=ir->capacity?ir->capacity*2:8; ir->stmts=realloc(ir->stmts,sizeof(IRStmt)*ir->capacity); }
-    ir->stmts[ir->count++]=s;
+    return &ir->stmts[ir->count++];
 }
-static void ir_free(IR* ir){ for(int i=0;i<ir->count;i++) free(ir->stmts[i].arg_indices); free(ir->stmts); }
 
-// ---------------- Parsing ----------------
+// ---------------- Argument Pool ----------------
+static int arg_pool[ARG_POOL_SIZE]; static int arg_top=0;
+static int* arg_alloc(int n){ if(arg_top+n>ARG_POOL_SIZE){ fprintf(stderr,"Arg pool full\n"); exit(1); } int* ptr=&arg_pool[arg_top]; arg_top+=n; return ptr; }
+
+// ---------------- Parsing (manual pointer scanning) ----------------
 static IRStmt parse_statement(char* stmt){
     IRStmt s={0};
-    char* comment=strstr(stmt,"--"); if(comment)*comment='\0';
-    while(isspace(*stmt)) stmt++;
-    if(*stmt=='\0') return s;
+    char* c=strstr(stmt,"--"); if(c)*c='\0';
+    while(isspace(*stmt)) stmt++; if(*stmt=='\0') return s;
 
+    // LHS
     char* eq=strchr(stmt,'='); if(!eq) return s; *eq='\0';
-    s.lhs_index=var_index(stmt);
-    char* rhs=eq+1; while(isspace(*rhs)) rhs++;
+    s.lhs_index=var_index(stmt); char* rhs=eq+1; while(isspace(*rhs)) rhs++;
+
+    // Function name
     char* paren=strchr(rhs,'('); if(!paren) return s; *paren='\0';
+    while(isspace(*rhs)) rhs++; s.func_ptr=get_func(rhs);
 
-    char funcname[256]; strcpy(funcname,rhs); while(isspace(*funcname)) funcname++;
-    s.func_ptr=get_func(funcname);
-
-    char* args_str=paren+1;
-    char* close=strrchr(args_str,')'); if(!close) return s; *close='\0';
-
-    int cap=4; s.arg_indices=malloc(sizeof(int)*cap); s.argc=0;
-    char* token=strtok(args_str,",");
-    while(token){
-        while(isspace(*token)) token++;
-        if(*token=='\0'){ token=strtok(NULL,","); continue; }
-        if(s.argc>=cap){ cap*=2; s.arg_indices=realloc(s.arg_indices,sizeof(int)*cap); }
-        s.arg_indices[s.argc++]=var_index(token);
-        token=strtok(NULL,",");
+    // Arguments
+    char* args_str=paren+1; char* close=strrchr(args_str,')'); if(!close) return s; *close='\0';
+    s.arg_indices=arg_alloc(16); s.argc=0; // max 16 args per statement
+    char* p=args_str; while(*p){
+        while(isspace(*p)) p++; if(*p==',' || *p==')'){ p++; continue; }
+        char* start=p; while(*p && *p!=',' && *p!=')') p++;
+        if(p>start) s.arg_indices[s.argc++]=var_index(start);
+        if(*p==',') p++;
     }
     return s;
 }
@@ -181,8 +139,7 @@ static IRStmt parse_statement(char* stmt){
 int main(int argc,char** argv){
     if(argc<3){ printf("Usage: %s input.optivar output.oir\n",argv[0]); return 1; }
 
-    pool_init();
-    preload_binfuncs("binfuncs");
+    pool_reset(); preload_binfuncs("binfuncs");
 
     FILE* f=fopen(argv[1],"r"); if(!f){ perror("fopen"); return 1; }
     fseek(f,0,SEEK_END); long len=ftell(f); fseek(f,0,SEEK_SET);
@@ -190,18 +147,14 @@ int main(int argc,char** argv){
 
     IR ir; ir_init(&ir);
     char* stmt=strtok(buf,";");
-    while(stmt){ ir_add(&ir,parse_statement(stmt)); stmt=strtok(NULL,";"); }
+    while(stmt){ *ir_alloc_stmt(&ir)=parse_statement(stmt); stmt=strtok(NULL,";"); }
     free(buf);
 
-    FILE* out=fopen(argv[2],"wb");
-    if(!out){ perror("fopen output"); return 1; }
+    FILE* out=fopen(argv[2],"wb"); if(!out){ perror("fopen output"); return 1; }
     fwrite(ir.stmts,sizeof(IRStmt),ir.count,out);
     fclose(out);
 
-    pool_reset();
-    ir_free(&ir);
-    free_func_table();
-
+    pool_reset(); free_func_table();
     printf("Compilation complete: %d IR statements written to %s\n", ir.count, argv[2]);
     return 0;
 }
