@@ -18,6 +18,8 @@ typedef struct VarSlot {
     void* data;
     int in_use;
     int last_use;
+    int constant; // 1 if value known at compile-time
+    long value;   // store constant value if known
 } VarSlot;
 
 // ---------------- Variable Pools ----------------
@@ -38,24 +40,26 @@ static int var_count = 0;
 
 // ---------------- Allocate variable slot ----------------
 VarSlot* pool_alloc() {
-    // Try to reuse fixed pool
     for (int i = 0; i < fixed_top; i++)
         if (!fixed_pool[i].in_use) { fixed_pool[i].in_use = 1; return &fixed_pool[i]; }
 
     if (fixed_top < FIXED_VARS) {
         VarSlot* slot = &fixed_pool[fixed_top++];
-        slot->in_use = 1; slot->last_use = -1; return slot;
+        slot->in_use = 1; slot->last_use = -1; slot->constant = 0; return slot;
     }
 
-    // Try to reuse dynamic pool slots
     VarPoolChunk* chunk = dynamic_pool;
     while (chunk) {
         for (int i = 0; i < chunk->capacity; i++)
-            if (!chunk->slots[i].in_use) { chunk->slots[i].in_use = 1; chunk->slots[i].last_use = -1; return &chunk->slots[i]; }
+            if (!chunk->slots[i].in_use) { 
+                chunk->slots[i].in_use = 1; 
+                chunk->slots[i].last_use = -1; 
+                chunk->slots[i].constant = 0; 
+                return &chunk->slots[i]; 
+            }
         chunk = chunk->next;
     }
 
-    // Allocate new dynamic chunk
     VarPoolChunk* new_chunk = malloc(sizeof(VarPoolChunk));
     new_chunk->slots = calloc(VAR_CHUNK_SIZE, sizeof(VarSlot));
     new_chunk->capacity = VAR_CHUNK_SIZE;
@@ -63,6 +67,7 @@ VarSlot* pool_alloc() {
     dynamic_pool = new_chunk;
     new_chunk->slots[0].in_use = 1;
     new_chunk->slots[0].last_use = -1;
+    new_chunk->slots[0].constant = 0;
     return &new_chunk->slots[0];
 }
 
@@ -151,6 +156,7 @@ typedef struct IRStmt{
     void* func_ptr;
     int argc;
     int* arg_indices;
+    int dead;       // 1 if statement is dead (DCE)
 } IRStmt;
 
 typedef struct IR{
@@ -170,12 +176,9 @@ typedef struct ArgBlock { int* args; int capacity; struct ArgBlock* next; } ArgB
 static ArgBlock* arg_blocks = NULL;
 
 int* arg_alloc(int n){
-    if (n <= FIXED_ARG_POOL) return fixed_arg_pool;  // fast path
+    if (n <= FIXED_ARG_POOL) return fixed_arg_pool;
     ArgBlock* block = arg_blocks;
-    while (block) {
-        if (block->capacity >= n) { return block->args; }
-        block = block->next;
-    }
+    while (block) { if (block->capacity >= n) return block->args; block = block->next; }
     block = malloc(sizeof(ArgBlock));
     block->args = malloc(sizeof(int) * n);
     block->capacity = n;
@@ -186,7 +189,8 @@ int* arg_alloc(int n){
 
 // ---------------- Parsing ----------------
 static IRStmt parse_statement(char* stmt){
-    IRStmt s={0}; char* c=strstr(stmt,"--"); if(c)*c='\0';
+    IRStmt s={0}; s.dead=0;
+    char* c=strstr(stmt,"--"); if(c)*c='\0';
     while(isspace(*stmt)) stmt++; if(*stmt=='\0') return s;
     char* eq=strchr(stmt,'='); if(!eq) return s; *eq='\0';
     s.lhs_index=var_index(stmt); char* rhs=eq+1; while(isspace(*rhs)) rhs++;
@@ -200,6 +204,56 @@ static IRStmt parse_statement(char* stmt){
         if(*p==',') p++;
     }
     return s;
+}
+
+// ---------------- Compile-time optimization passes ----------------
+void constant_folding(IR* ir){
+    for(int i=0;i<ir->count;i++){
+        IRStmt* s = &ir->stmts[i];
+        if(s->dead) continue;
+        int all_const=1; long val=0;
+        for(int j=0;j<s->argc;j++){
+            VarSlot* arg = env_array[s->arg_indices[j]];
+            if(!arg->constant){ all_const=0; break; }
+            val += arg->value; // Example: sum fold
+        }
+        if(all_const){
+            VarSlot* lhs = env_array[s->lhs_index];
+            lhs->constant=1; lhs->value=val;
+            s->func_ptr=NULL; // no runtime call needed
+        }
+    }
+}
+
+void dead_code_elimination(IR* ir){
+    // mark statements whose lhs is never used
+    int used[var_count]; memset(used,0,sizeof(used));
+    for(int i=ir->count-1;i>=0;i--){
+        IRStmt* s = &ir->stmts[i];
+        if(!s->func_ptr){ continue; } // already constant
+        if(!used[s->lhs_index]) s->dead=1;
+        for(int j=0;j<s->argc;j++) used[s->arg_indices[j]]=1;
+    }
+}
+
+void ir_batching(IR* ir){
+    // merge consecutive statements with same func_ptr
+    for(int i=0;i<ir->count-1;i++){
+        IRStmt* s = &ir->stmts[i];
+        if(s->dead || !s->func_ptr) continue;
+        IRStmt* next = &ir->stmts[i+1];
+        if(next->dead || !next->func_ptr) continue;
+        if(s->func_ptr == next->func_ptr){
+            // simple example: merge next's args into s's args
+            int total_args = s->argc + next->argc;
+            int* merged_args = arg_alloc(total_args);
+            memcpy(merged_args,s->arg_indices,sizeof(int)*s->argc);
+            memcpy(merged_args+s->argc,next->arg_indices,sizeof(int)*next->argc);
+            s->arg_indices = merged_args;
+            s->argc = total_args;
+            next->dead=1;
+        }
+    }
 }
 
 // ---------------- Compiler ----------------
@@ -217,22 +271,25 @@ int main(int argc,char** argv){
     int stmt_index=0;
     while(stmt){
         IRStmt s = parse_statement(stmt);
-
-        // Update last use for arguments
+        // update last use
         for(int i=0;i<s.argc;i++){
             VarSlot* slot = env_array[s.arg_indices[i]];
             if(slot->last_use < stmt_index) slot->last_use = stmt_index;
         }
-
         IRStmt* ir_stmt = ir_alloc_stmt(&ir);
         *ir_stmt = s;
-
         stmt=strtok(NULL,";");
         stmt_index++;
     }
     free(buf);
 
-    FILE* out=fopen(argv[2],"wb"); if(!out){ perror("fopen output"); return 1; }
+    // Optimization passes
+    constant_folding(&ir);
+    dead_code_elimination(&ir);
+    ir_batching(&ir);
+
+    // Write optimized IR
+    FILE* out=fopen(argv[2],"wb"); if(!out){ perror("fopen"); return 1; }
     fwrite(ir.stmts,sizeof(IRStmt),ir.count,out);
     fclose(out);
 
