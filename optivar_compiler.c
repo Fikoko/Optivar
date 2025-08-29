@@ -12,14 +12,15 @@
 #define VAR_CHUNK_SIZE 1024
 #define FIXED_ARG_POOL 64
 #define ARG_BLOCK_SIZE 1024
+#define INLINE_THRESHOLD 3  // Inline .bin functions <=3 bytes
 
 // ---------------- Variable Slot ----------------
 typedef struct VarSlot {
     void* data;
     int in_use;
     int last_use;
-    int constant; // 1 if value known at compile-time
-    long value;   // store constant value if known
+    int constant;  
+    long value;    
 } VarSlot;
 
 // ---------------- Variable Pools ----------------
@@ -45,17 +46,18 @@ VarSlot* pool_alloc() {
 
     if (fixed_top < FIXED_VARS) {
         VarSlot* slot = &fixed_pool[fixed_top++];
-        slot->in_use = 1; slot->last_use = -1; slot->constant = 0; return slot;
+        slot->in_use = 1; slot->last_use = -1; slot->constant = 0;
+        return slot;
     }
 
     VarPoolChunk* chunk = dynamic_pool;
     while (chunk) {
         for (int i = 0; i < chunk->capacity; i++)
-            if (!chunk->slots[i].in_use) { 
-                chunk->slots[i].in_use = 1; 
-                chunk->slots[i].last_use = -1; 
-                chunk->slots[i].constant = 0; 
-                return &chunk->slots[i]; 
+            if (!chunk->slots[i].in_use) {
+                chunk->slots[i].in_use = 1;
+                chunk->slots[i].last_use = -1;
+                chunk->slots[i].constant = 0;
+                return &chunk->slots[i];
             }
         chunk = chunk->next;
     }
@@ -104,7 +106,6 @@ typedef struct { char* name; void* ptr; size_t len; size_t offset; } FuncEntry;
 static FuncEntry func_table[256];
 static int func_count = 0;
 static char* func_blob = NULL;
-static size_t blob_size = 0;
 
 static void preload_binfuncs(const char* dirpath) {
     DIR* dir = opendir(dirpath); if (!dir){ perror("opendir"); return; }
@@ -142,12 +143,13 @@ static void preload_binfuncs(const char* dirpath) {
             }
         }
     }
-    closedir(dir); blob_size = offset;
+    closedir(dir);
 }
 
+// ---------------- Free Function Table ----------------
 static void free_func_table(){
     for(int i=0;i<func_count;i++) free(func_table[i].name);
-    if(func_blob) munmap(func_blob,blob_size);
+    if(func_blob) munmap(func_blob,func_blob ? func_blob : 0);
 }
 
 // ---------------- IR ----------------
@@ -156,7 +158,8 @@ typedef struct IRStmt{
     void* func_ptr;
     int argc;
     int* arg_indices;
-    int dead;       // 1 if statement is dead (DCE)
+    int dead;
+    int inlined;
 } IRStmt;
 
 typedef struct IR{
@@ -170,7 +173,7 @@ IRStmt* ir_alloc_stmt(IR* ir){
     return &ir->stmts[ir->count++];
 }
 
-// ---------------- Argument Pool (Unlimited) ----------------
+// ---------------- Argument Pool ----------------
 static int fixed_arg_pool[FIXED_ARG_POOL];
 typedef struct ArgBlock { int* args; int capacity; struct ArgBlock* next; } ArgBlock;
 static ArgBlock* arg_blocks = NULL;
@@ -189,7 +192,7 @@ int* arg_alloc(int n){
 
 // ---------------- Parsing ----------------
 static IRStmt parse_statement(char* stmt){
-    IRStmt s={0}; s.dead=0;
+    IRStmt s={0}; s.dead=0;s.inlined=0;
     char* c=strstr(stmt,"--"); if(c)*c='\0';
     while(isspace(*stmt)) stmt++; if(*stmt=='\0') return s;
     char* eq=strchr(stmt,'='); if(!eq) return s; *eq='\0';
@@ -206,7 +209,7 @@ static IRStmt parse_statement(char* stmt){
     return s;
 }
 
-// ---------------- Compile-time optimization passes ----------------
+// ---------------- Optimization Passes ----------------
 void constant_folding(IR* ir){
     for(int i=0;i<ir->count;i++){
         IRStmt* s = &ir->stmts[i];
@@ -215,36 +218,33 @@ void constant_folding(IR* ir){
         for(int j=0;j<s->argc;j++){
             VarSlot* arg = env_array[s->arg_indices[j]];
             if(!arg->constant){ all_const=0; break; }
-            val += arg->value; // Example: sum fold
+            val += arg->value;
         }
         if(all_const){
             VarSlot* lhs = env_array[s->lhs_index];
             lhs->constant=1; lhs->value=val;
-            s->func_ptr=NULL; // no runtime call needed
+            s->func_ptr=NULL;
         }
     }
 }
 
 void dead_code_elimination(IR* ir){
-    // mark statements whose lhs is never used
     int used[var_count]; memset(used,0,sizeof(used));
     for(int i=ir->count-1;i>=0;i--){
         IRStmt* s = &ir->stmts[i];
-        if(!s->func_ptr){ continue; } // already constant
+        if(!s->func_ptr) continue;
         if(!used[s->lhs_index]) s->dead=1;
         for(int j=0;j<s->argc;j++) used[s->arg_indices[j]]=1;
     }
 }
 
 void ir_batching(IR* ir){
-    // merge consecutive statements with same func_ptr
     for(int i=0;i<ir->count-1;i++){
         IRStmt* s = &ir->stmts[i];
         if(s->dead || !s->func_ptr) continue;
         IRStmt* next = &ir->stmts[i+1];
         if(next->dead || !next->func_ptr) continue;
         if(s->func_ptr == next->func_ptr){
-            // simple example: merge next's args into s's args
             int total_args = s->argc + next->argc;
             int* merged_args = arg_alloc(total_args);
             memcpy(merged_args,s->arg_indices,sizeof(int)*s->argc);
@@ -256,11 +256,64 @@ void ir_batching(IR* ir){
     }
 }
 
-// ---------------- Compiler ----------------
-int main(int argc,char** argv){
-    if(argc<3){ printf("Usage: %s input.optivar output.oir\n",argv[0]); return 1; }
+// ---------------- Runtime Execution ----------------
+static void execute_stmt(IRStmt* s){
+    if(s->dead) return;
 
-    preload_binfuncs("binfuncs");
+    long args_values[FIXED_ARG_POOL];
+    for(int i=0;i<s->argc;i++){
+        VarSlot* v = env_array[s->arg_indices[i]];
+        if(v->constant) args_values[i]=v->value;
+        else args_values[i]=(long)v->data;
+    }
+
+    if(s->func_ptr){
+        void (*fn)(long*, long*) = s->func_ptr;
+        fn(&env_array[s->lhs_index]->value, args_values);
+        env_array[s->lhs_index]->constant = 0;
+    }
+}
+
+void execute_ir(IR* ir){
+    for(int i=0;i<ir->count;i++) execute_stmt(&ir->stmts[i]);
+}
+
+// ---------------- Load IR ----------------
+IR* load_oir(const char* filename){
+    FILE* f = fopen(filename,"rb");
+    if(!f){ perror(filename); return NULL; }
+    fseek(f,0,SEEK_END); long len=ftell(f); fseek(f,0,SEEK_SET);
+    int count = len / sizeof(IRStmt);
+    IR* ir = malloc(sizeof(IR));
+    ir->count = count;
+    ir->stmts = malloc(sizeof(IRStmt)*count);
+    fread(ir->stmts,sizeof(IRStmt),count,f);
+    fclose(f);
+    return ir;
+}
+
+// ---------------- Environment Init ----------------
+void init_env(int total_vars){
+    env_array = malloc(sizeof(VarSlot*)*total_vars);
+    for(int i=0;i<total_vars;i++){
+        env_array[i] = malloc(sizeof(VarSlot));
+        env_array[i]->data=NULL;
+        env_array[i]->constant=0;
+        env_array[i]->value=0;
+    }
+    var_count = total_vars;
+}
+
+void free_env(){
+    for(int i=0;i<var_count;i++) free(env_array[i]);
+    free(env_array);
+}
+
+// ---------------- Compiler + Runtime Main ----------------
+int main(int argc,char** argv){
+    if(argc<3){ printf("Usage: %s input.optivar binfuncs_dir\n",argv[0]); return 1; }
+
+    preload_binfuncs(argv[2]);
 
     FILE* f=fopen(argv[1],"r"); if(!f){ perror("fopen"); return 1; }
     fseek(f,0,SEEK_END); long len=ftell(f); fseek(f,0,SEEK_SET);
@@ -271,7 +324,6 @@ int main(int argc,char** argv){
     int stmt_index=0;
     while(stmt){
         IRStmt s = parse_statement(stmt);
-        // update last use
         for(int i=0;i<s.argc;i++){
             VarSlot* slot = env_array[s.arg_indices[i]];
             if(slot->last_use < stmt_index) slot->last_use = stmt_index;
@@ -288,12 +340,20 @@ int main(int argc,char** argv){
     dead_code_elimination(&ir);
     ir_batching(&ir);
 
-    // Write optimized IR
-    FILE* out=fopen(argv[2],"wb"); if(!out){ perror("fopen"); return 1; }
-    fwrite(ir.stmts,sizeof(IRStmt),ir.count,out);
-    fclose(out);
+    // Execute IR immediately
+    int max_var_index=0;
+    for(int i=0;i<ir.count;i++)
+        if(ir.stmts[i].lhs_index>max_var_index) max_var_index=ir.stmts[i].lhs_index;
+    init_env(max_var_index+1);
 
+    execute_ir(&ir);
+
+    for(int i=0;i<var_count;i++)
+        printf("Var %d = %ld\n", i, env_array[i]->value);
+
+    free_env();
     free_func_table();
-    printf("Compilation complete: %d IR statements written to %s\n", ir.count, argv[2]);
+    free(ir.stmts);
+
     return 0;
 }
