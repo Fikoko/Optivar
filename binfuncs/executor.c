@@ -11,7 +11,7 @@ typedef struct VarSlot {
     pthread_mutex_t lock;
 } VarSlot;
 
-typedef struct IRStmt {
+typedef struct IRStmt{
     int lhs_index;
     void* func_ptr;
     int argc;
@@ -49,7 +49,7 @@ static void execute_stmt(IRStmt* s, VarSlot** env_array) {
         return;
     }
 
-    long* args_values = malloc(sizeof(long)*s->argc);
+    long args_values[64]; // adjust if needed
     for(int i=0;i<s->argc;i++){
         VarSlot* arg = env_array[s->arg_indices[i]];
         args_values[i] = arg->constant ? arg->value : (long)arg->data;
@@ -61,7 +61,6 @@ static void execute_stmt(IRStmt* s, VarSlot** env_array) {
     lhs->constant = 0;
     pthread_mutex_unlock(&lhs->lock);
 
-    free(args_values);
     s->executed = 1;
 }
 
@@ -103,7 +102,7 @@ static void* thread_worker(void* arg){
     return NULL;
 }
 
-// Function exported to compiler
+// Function called by compiler
 void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array, int max_threads){
     pthread_t threads[max_threads];
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
