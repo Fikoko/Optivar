@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #define MAX_IR 8192
 #define FIXED_VARS 1024
@@ -89,7 +90,7 @@ int var_index(const char* name) {
             slot->data=strdup(name); 
             var_table[idx]=slot;
             if(var_count >= env_alloc_size){
-                env_alloc_size *= 2;
+                env_alloc_size = env_alloc_size ? env_alloc_size*2 : FIXED_VARS;
                 env_array = realloc(env_array, sizeof(VarSlot*) * env_alloc_size);
             }
             env_array[var_count]=slot; 
@@ -159,8 +160,7 @@ void preload_binfuncs(const char* dirpath) {
             FILE* f=fopen(path,"rb"); 
             if(!f){ perror(path); continue; }
             fseek(f,0,SEEK_END); 
-            long flen=ftell(f); 
-            fseek(f,0,SEEK_SET);
+            long flen=ftell(f); fseek(f,0,SEEK_SET);
             fread(func_blob+offset,1,flen,f); 
             fclose(f);
             strncpy(func_table[func_count].name,funcname,MAX_NAME_LEN); 
@@ -175,6 +175,8 @@ void preload_binfuncs(const char* dirpath) {
 }
 
 void free_func_table(){ if(func_blob) munmap(func_blob,func_blob_size); }
+
+// ---------------- IR, parsing, batching, optimizations ----------------
 
 typedef struct IRStmt{
     int lhs_index;
@@ -306,8 +308,8 @@ void ir_batching(IR* ir){
             int* merged=arg_alloc(total_args); 
             memcpy(merged,s->arg_indices,sizeof(int)*s->argc); 
             memcpy(merged+s->argc,next->arg_indices,sizeof(int)*next->argc); 
-            s->arg_indices=merged; 
-            s->argc=total_args; 
+            s.arg_indices=merged; 
+            s.argc=total_args; 
             next->dead=1; 
         } 
     } 
@@ -330,6 +332,7 @@ void build_dependencies(IR* ir){
     } 
 }
 
+// ---------------- Environment ----------------
 void init_env(int total_vars){ 
     env_array=malloc(sizeof(VarSlot*)*total_vars); 
     env_alloc_size=total_vars; 
@@ -352,6 +355,8 @@ void free_env(){
     free(env_array); 
 }
 
+extern void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array, int max_threads);
+
 int main(int argc,char** argv){
     if(argc<3){ printf("Usage: %s input.optivar binfuncs_dir\n",argv[0]); return 1; }
     init_env(FIXED_VARS*2);
@@ -372,10 +377,8 @@ int main(int argc,char** argv){
     constant_folding(&ir); dead_code_elimination(&ir); ir_batching(&ir);
     build_dependencies(&ir);
 
-    // Call .bin executor
     if(func_count>0 && func_table[0].ptr) { 
-        void (*bin_exec)(IRStmt*, int, VarSlot**, int) = func_table[0].ptr; 
-        bin_exec(ir.stmts, ir.count, env_array, 8); 
+        executor(ir.stmts, ir.count, env_array, 8); 
     }
 
     for(int i=0;i<var_count;i++) printf("Var %d = %ld\n",i,env_array[i]->value);
