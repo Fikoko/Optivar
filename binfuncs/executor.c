@@ -49,7 +49,7 @@ static void execute_stmt(IRStmt* s, VarSlot** env_array) {
         return;
     }
 
-    long args_values[64]; // can be dynamic if needed
+    long* args_values = malloc(sizeof(long) * s->argc);
     for(int i=0;i<s->argc;i++){
         VarSlot* arg = env_array[s->arg_indices[i]];
         args_values[i] = arg->constant ? arg->value : (long)arg->data;
@@ -61,6 +61,7 @@ static void execute_stmt(IRStmt* s, VarSlot** env_array) {
     lhs->constant = 0;
     pthread_mutex_unlock(&lhs->lock);
 
+    free(args_values);
     s->executed = 1;
 }
 
