@@ -510,3 +510,111 @@ static void cleanup() {
     if (func_blob) munmap(func_blob, func_blob_size);
     if (func_table) { free(func_table); func_table = NULL; } // Free dynamic func_table
 }
+
+// ---------------- Parser ----------------
+static IRStmt* parse_line(const char* line, IR* ir) {
+    // Skip empty lines and comments
+    while (isspace(*line)) line++;
+    if (*line == '\0' || strncmp(line, "--", 2) == 0) return NULL;
+
+    char lhs_name[MAX_NAME_LEN] = {0};
+    char func_name[MAX_NAME_LEN] = {0};
+    char args_buf[1024];
+    int arg_count = 0;
+    int arg_indices[MAX_ARGS];
+
+    const char* eq = strchr(line, '=');
+    if (!eq) return NULL; // invalid line
+    size_t lhs_len = eq - line;
+    while (lhs_len > 0 && isspace(line[lhs_len - 1])) lhs_len--;
+    strncpy(lhs_name, line, lhs_len);
+    lhs_name[lhs_len] = '\0';
+
+    const char* paren = strchr(eq, '(');
+    const char* semi = strchr(eq, ';');
+    if (!paren || !semi) return NULL;
+
+    size_t func_len = paren - eq - 1;
+    while (func_len > 0 && isspace(*(eq + 1 + func_len - 1))) func_len--;
+    strncpy(func_name, eq + 1, func_len);
+    func_name[func_len] = '\0';
+
+    size_t args_len = semi - paren - 1;
+    strncpy(args_buf, paren + 1, args_len);
+    args_buf[args_len] = '\0';
+
+    // Tokenize arguments
+    char* tok = strtok(args_buf, ",");
+    while (tok && arg_count < MAX_ARGS) {
+        while (isspace(*tok)) tok++;
+        char* end = tok + strlen(tok) - 1;
+        while (end > tok && isspace(*end)) { *end = '\0'; end--; }
+        arg_indices[arg_count++] = var_index(tok);
+        tok = strtok(NULL, ",");
+    }
+
+    // Build IRStmt
+    IRStmt* stmt = ir_alloc_stmt(ir);
+    stmt->lhs_index = var_index(lhs_name);
+    stmt->argc = arg_count;
+    stmt->arg_indices = arg_alloc(arg_count);
+    memcpy(stmt->arg_indices, arg_indices, sizeof(int) * arg_count);
+    stmt->func_ptr = get_func_ptr(func_name, &arg_count); // lazy load
+    stmt->inlined = 0;
+    stmt->dep_count = 0;
+    stmt->dep_indices = NULL;
+    stmt->dead = 0;
+    stmt->executed = 0;
+
+    return stmt;
+}
+
+static IR* parse_script_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) { perror("fopen script"); return NULL; }
+    IR* ir = malloc(sizeof(IR));
+    ir_init(ir);
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        parse_line(line, ir);
+    }
+    fclose(f);
+    return ir;
+}
+
+// ---------------- Main ----------------
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <script.optivar>\n", argv[0]);
+        return 1;
+    }
+
+    const char* script_path = argv[1];
+
+    // Preload all functions (optional, directory ./funcs)
+    preload_binfuncs("./funcs");
+
+    // Parse script
+    IR* ir = parse_script_file(script_path);
+    if (!ir) { fprintf(stderr, "Failed to parse script.\n"); return 1; }
+
+    // Initialize environment
+    init_full_env(var_count);
+
+    // Execute
+    executor(ir->stmts, ir->count, env_array, MAX_THREADS_DEFAULT);
+
+    // Print results
+    for (int i = 0; i < var_count; i++) {
+        VarSlot* v = env_array[i];
+        printf("%s = %ld\n", (char*)v->data, v->value);
+    }
+
+    // Cleanup
+    cleanup();
+    free(ir->stmts);
+    free(ir);
+
+    return 0;
+}
+
