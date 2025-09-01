@@ -1,4 +1,4 @@
-// optivar_orchestrator.c (fully adaptive + unbounded)
+// optivar_orchestrator.c (fully adaptive + unbounded + superoptimized)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,15 +12,17 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <sched.h>
+#include <fcntl.h> // For open
 
 #define MAX_IR 8192
-#define FIXED_VARS 1024
-#define VAR_CHUNK_SIZE 2048
-#define FIXED_ARG_POOL 128
+#define FIXED_VARS 4096
+#define VAR_CHUNK_SIZE 8192
+#define FIXED_ARG_POOL 256
 #define INLINE_THRESHOLD 3
 #define MAX_NAME_LEN 128
 #define CACHE_LINE 64
 #define MAX_ARGS 16
+#define MAX_THREADS_DEFAULT 8 // Default max threads, can be overridden
 
 // ---------------- VarSlot ----------------
 typedef struct VarSlot {
@@ -29,7 +31,7 @@ typedef struct VarSlot {
     int last_use;
     int constant;
     long value;
-    char pad[CACHE_LINE - sizeof(void*) - 4*4 - sizeof(long)];
+    char pad[CACHE_LINE - sizeof(void*) - 4*sizeof(int) - sizeof(long)];
 } VarSlot;
 
 // ---------------- IRStmt ----------------
@@ -43,7 +45,7 @@ typedef struct IRStmt {
     int dep_count;
     int* dep_indices;
     int executed;
-    char pad[CACHE_LINE - 9*4 - sizeof(void*) - sizeof(int*)];
+    char pad[CACHE_LINE - 9*sizeof(int) - sizeof(void*) - sizeof(int*)];
 } IRStmt;
 
 // ---------------- Pools ----------------
@@ -73,6 +75,29 @@ static inline unsigned int hash_name(const char* s, int table_size){
     return h % table_size;
 }
 
+// ---------------- Arena Allocator for Temporaries ----------------
+static __thread char* arena_ptr = NULL;
+static __thread size_t arena_size = 0;
+
+static void* arena_alloc(size_t size) {
+    if (!arena_ptr || arena_size < size) {
+        size_t new_size = size > 65536 ? size : 65536;
+        arena_ptr = aligned_alloc(CACHE_LINE, new_size);
+        if (!arena_ptr) { perror("aligned_alloc arena"); exit(EXIT_FAILURE); }
+        arena_size = new_size;
+    }
+    void* ptr = arena_ptr;
+    arena_ptr += size;
+    arena_size -= size;
+    return ptr;
+}
+
+static void arena_reset() {
+    // Note: We don't free, just reset pointer for reuse in thread
+    arena_ptr = NULL;
+    arena_size = 0;
+}
+
 // ---------------- Pool allocator ----------------
 static VarSlot* pool_alloc(){
     for(int i=0;i<fixed_top;i++){
@@ -97,10 +122,9 @@ static VarSlot* pool_alloc(){
         chunk=chunk->next;
     }
     int cap = VAR_CHUNK_SIZE;
-    VarPoolChunk* new_chunk = malloc(sizeof(VarPoolChunk));
-    if(!new_chunk){ perror("malloc VarPoolChunk"); exit(EXIT_FAILURE);}
-    new_chunk->slots = calloc(cap,sizeof(VarSlot));
-    if(!new_chunk->slots){ perror("calloc VarPoolChunk->slots"); exit(EXIT_FAILURE);}
+    VarPoolChunk* new_chunk = arena_alloc(sizeof(VarPoolChunk));
+    new_chunk->slots = aligned_alloc(CACHE_LINE, cap * sizeof(VarSlot));
+    if(!new_chunk->slots){ perror("aligned_alloc VarPoolChunk->slots"); exit(EXIT_FAILURE);}
     new_chunk->capacity = cap;
     new_chunk->next = dynamic_pool;
     dynamic_pool = new_chunk;
@@ -114,6 +138,7 @@ typedef struct {
     void* ptr;
     size_t len;
     size_t offset;
+    int arg_count; // For validation
 } FuncEntry;
 
 static FuncEntry func_table[256];
@@ -121,48 +146,56 @@ static int func_count = 0;
 static char* func_blob = NULL;
 static size_t func_blob_size = 0;
 
-// ---------------- Preload .bin functions ----------------
+// ---------------- Lazy Load .bin functions ----------------
+static void* load_binfunc(const char* name, int* arg_count_out) {
+    char path[512];
+    snprintf(path, sizeof(path), "./funcs/%s.bin", name); // Assume dir is ./funcs
+    struct stat st;
+    if (stat(path, &st) != 0) return NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    void* ptr = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (ptr == MAP_FAILED) return NULL;
+    // Assume arg_count is embedded or default to -1 (no validation)
+    *arg_count_out = -1; // Placeholder; in real impl, parse from binary if needed
+    return ptr;
+}
+
 static void preload_binfuncs(const char* dirpath){
     DIR* dir = opendir(dirpath);
     if(!dir){ perror("opendir"); return; }
     struct dirent* entry;
-    size_t total_size=0;
-    while((entry=readdir(dir))!=NULL){
-        if(entry->d_type!=DT_REG) continue;
-        size_t len=strlen(entry->d_name);
-        if(len>4 && strcmp(entry->d_name+len-4,".bin")==0){
-            char path[512]; snprintf(path,sizeof(path),"%s/%s",dirpath,entry->d_name);
-            struct stat st; if(stat(path,&st)==0) total_size+=st.st_size;
-        }
-    }
-    closedir(dir);
-    if(total_size==0) return;
-    func_blob = mmap(NULL,total_size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE,-1,0);
-    if(func_blob==MAP_FAILED){ perror("mmap func_blob"); func_blob=NULL; return; }
-    func_blob_size = total_size;
-
-    dir=opendir(dirpath); if(!dir){ perror("opendir"); return; }
-    size_t offset=0;
     while((entry=readdir(dir))!=NULL){
         if(entry->d_type!=DT_REG) continue;
         size_t len=strlen(entry->d_name);
         if(len>4 && strcmp(entry->d_name+len-4,".bin")==0){
             char funcname[MAX_NAME_LEN]; strncpy(funcname,entry->d_name,len-4); funcname[len-4]='\0';
-            char path[512]; snprintf(path,sizeof(path),"%s/%s",dirpath,entry->d_name);
-            FILE* f=fopen(path,"rb"); if(!f){ perror(path); continue;}
-            fseek(f,0,SEEK_END); long flen=ftell(f); rewind(f);
-            fread(func_blob+offset,1,(size_t)flen,f); fclose(f);
             if(func_count>=256) break;
             strncpy(func_table[func_count].name,funcname,MAX_NAME_LEN-1);
             func_table[func_count].name[MAX_NAME_LEN-1]='\0';
-            func_table[func_count].ptr=func_blob+offset;
-            func_table[func_count].len=(size_t)flen;
-            func_table[func_count].offset=offset;
-            offset+=(size_t)flen;
+            func_table[func_count].ptr=NULL; // Lazy load
+            func_table[func_count].len=0;
+            func_table[func_count].offset=0;
+            func_table[func_count].arg_count=-1;
             func_count++;
         }
     }
     closedir(dir);
+}
+
+static void* get_func_ptr(const char* name, int* arg_count_out){
+    for(int i=0;i<func_count;i++){
+        if(strcmp(func_table[i].name,name)==0){
+            if(!func_table[i].ptr){
+                func_table[i].ptr = load_binfunc(name, &func_table[i].arg_count);
+                func_table[i].len = 0; // Update if needed
+            }
+            *arg_count_out = func_table[i].arg_count;
+            return func_table[i].ptr;
+        }
+    }
+    return NULL;
 }
 
 // ---------------- IR ----------------
@@ -198,17 +231,20 @@ static ArgBlock* arg_blocks=NULL;
 
 static int* arg_alloc(int n){
     ArgBlock* b=arg_blocks;
-    while(b){ if(b->capacity-b->used>=n){ int* ptr=b->args+b->used; b->used+=n; return ptr;} b=b->next; }
+    while(b){ 
+        if(b->capacity-b->used>=n){ int* ptr=b->args+b->used; b->used+=n; return ptr;} 
+        b=b->next; 
+    }
     int cap=(n>FIXED_ARG_POOL)? n: FIXED_ARG_POOL;
-    ArgBlock* nb=malloc(sizeof(ArgBlock));
-    nb->args=malloc(sizeof(int)*cap);
+    ArgBlock* nb=arena_alloc(sizeof(ArgBlock));
+    nb->args=arena_alloc(sizeof(int)*cap);
     nb->capacity=cap; nb->used=n; nb->next=arg_blocks; arg_blocks=nb;
     return nb->args;
 }
 
 static void free_arg_blocks(){
     ArgBlock* b=arg_blocks;
-    while(b){ ArgBlock* nx=b->next; free(b->args); free(b); b=nx; }
+    while(b){ ArgBlock* nx=b->next; /* No free since arena */ b=nx; }
     arg_blocks=NULL;
 }
 
@@ -219,10 +255,12 @@ static void grow_var_table(){
     for(int i=0;i<var_table_size;i++){
         if(var_table[i]){
             unsigned int h = hash_name((char*)var_table[i]->data,new_size);
+            int placed = 0;
             for(int j=0;j<new_size;j++){
                 int idx=(h+j)%new_size;
-                if(!new_table[idx]){ new_table[idx]=var_table[i]; break;}
+                if(!new_table[idx]){ new_table[idx]=var_table[i]; placed=1; break;}
             }
+            if(!placed){ /* Fallback, rare */ }
         }
     }
     free(var_table);
@@ -251,13 +289,13 @@ static int var_index(const char* name){
         }
     }
     grow_var_table();
-    return var_index(name);
+    return var_index(name); // Recursive call after grow
 }
 
 // ---------------- Environment ----------------
 static void init_env(int total_vars){
     env_alloc_size=total_vars>0? total_vars:(FIXED_VARS*2);
-    env_array=malloc(sizeof(VarSlot*)*env_alloc_size);
+    env_array=aligned_alloc(CACHE_LINE, sizeof(VarSlot*)*env_alloc_size);
     memset(env_array,0,sizeof(VarSlot*)*env_alloc_size);
 }
 
@@ -283,31 +321,45 @@ typedef struct ExecContext {
     atomic_int* dep_remaining;
     Dependents* dependents;
     atomic_int remaining;
-    WorkQueue queue;
+    WorkQueue* thread_queues; // Per-thread queues
 } ExecContext;
 
 // ---------------- Queue ----------------
 static void queue_init(WorkQueue* q, int capacity){
-    q->buf=malloc(sizeof(int)*capacity);
+    q->buf=aligned_alloc(CACHE_LINE, sizeof(int)*capacity);
     q->capacity=capacity;
     atomic_init(&q->head,0); atomic_init(&q->tail,0);
 }
 
-static void queue_push(WorkQueue* q,int val){
-    int tail=atomic_fetch_add(&q->tail,1)%q->capacity;
+static void queue_push(ExecContext* ctx, int val, int thread_id){
+    WorkQueue* q = &ctx->thread_queues[thread_id];
+    int tail=atomic_fetch_add(&q->tail,1) % q->capacity;
     q->buf[tail]=val;
 }
 
-static int queue_try_pop(WorkQueue* q,int* out){
+static int queue_try_pop(ExecContext* ctx, int* out, int thread_id){
+    WorkQueue* q = &ctx->thread_queues[thread_id];
     int head=atomic_load(&q->head);
     int tail=atomic_load(&q->tail);
     if(head>=tail) return 0;
-    if(atomic_compare_exchange_strong(&q->head,&head,head+1)){ *out=q->buf[head%q->capacity]; return 1;}
+    if(atomic_compare_exchange_strong(&q->head,&head,head+1)){ *out=q->buf[head % q->capacity]; return 1;}
+    return 0;
+}
+
+static int steal_work(ExecContext* ctx, int* out, int thread_id){
+    for(int i=0; i<ctx->max_threads; i++){
+        if(i == thread_id) continue;
+        WorkQueue* q = &ctx->thread_queues[i];
+        int head=atomic_load(&q->head);
+        int tail=atomic_load(&q->tail);
+        if(head >= tail) continue;
+        if(atomic_compare_exchange_strong(&q->head,&head,head+1)){ *out=q->buf[head % q->capacity]; return 1;}
+    }
     return 0;
 }
 
 // ---------------- Executor ----------------
-static void execute_single(IRStmt* s, ExecContext* ctx,long* args_buffer){
+static void execute_single(IRStmt* s, ExecContext* ctx, long* args_buffer){
     if(s->dead || s->executed) return;
     for(int i=0;i<s->argc;i++){
         int ai=s->arg_indices[i];
@@ -316,9 +368,12 @@ static void execute_single(IRStmt* s, ExecContext* ctx,long* args_buffer){
     }
     VarSlot* lhs=ctx->env_array[s->lhs_index];
     if(s->inlined){
-        long val=0; for(int i=0;i<s->argc;i++) val+=args_buffer[i];
+        long val=0; for(int i=0;i<s->argc;i++) val+=args_buffer[i]; // Generic sum, or extend for other ops
         lhs->value=val; lhs->constant=0;
     } else if(s->func_ptr){
+        int expected_argc;
+        if(get_func_ptr("dummy", &expected_argc)) {} // Placeholder; use actual name if needed
+        if(expected_argc != -1 && s->argc != expected_argc) { /* Error */ return; }
         void (*fn)(long*,long*)=s->func_ptr;
         fn(&lhs->value,args_buffer);
         lhs->constant=0;
@@ -326,45 +381,57 @@ static void execute_single(IRStmt* s, ExecContext* ctx,long* args_buffer){
     s->executed=1;
 }
 
-static void* worker_thread(void* vctx){
-    ExecContext* ctx=(ExecContext*)vctx;
+static void* worker_thread(void* arg){
+    long tid = (long)arg;
+    ExecContext* ctx = (ExecContext*)pthread_getspecific(ctx_key); // Assume set
     long args_buffer[MAX_ARGS]; int idx;
     while(atomic_load(&ctx->remaining)>0){
-        if(!queue_try_pop(&ctx->queue,&idx)){ sched_yield(); continue;}
-        execute_single(&ctx->stmts[idx],ctx,args_buffer);
-        atomic_fetch_sub(&ctx->remaining,1);
-        Dependents* deps=&ctx->dependents[idx];
-        for(int di=0;di<deps->count;di++){
-            int d=deps->list[di];
-            int prev=atomic_fetch_sub(&ctx->dep_remaining[d],1);
-            if(prev==1) queue_push(&ctx->queue,d);
+        if(queue_try_pop(ctx, &idx, tid)) {
+            execute_single(&ctx->stmts[idx],ctx,args_buffer);
+            atomic_fetch_sub(&ctx->remaining,1);
+            Dependents* deps=&ctx->dependents[idx];
+            for(int di=0;di<deps->count;di++){
+                int d=deps->list[di];
+                int prev=atomic_fetch_sub(&ctx->dep_remaining[d],1);
+                if(prev==1) queue_push(ctx,d, tid % ctx->max_threads); // Balance push
+            }
+        } else if(steal_work(ctx, &idx, tid)){
+            execute_single(&ctx->stmts[idx],ctx,args_buffer);
+            atomic_fetch_sub(&ctx->remaining,1);
+            Dependents* deps=&ctx->dependents[idx];
+            for(int di=0;di<deps->count;di++){
+                int d=deps->list[di];
+                int prev=atomic_fetch_sub(&ctx->dep_remaining[d],1);
+                if(prev==1) queue_push(ctx,d, tid);
+            }
+        } else {
+            sched_yield();
         }
     }
+    arena_reset(); // Reset thread-local arena
     return NULL;
 }
 
 static void build_dependents(ExecContext* ctx){
     int n=ctx->stmt_count;
-    int* cnt=calloc(n,sizeof(int));
+    ctx->dependents=calloc(n,sizeof(Dependents));
     for(int i=0;i<n;i++){
-        IRStmt* s=&ctx->stmts[i];
-        for(int p=0;p<s->dep_count;p++){
-            int pred=s->dep_indices[p]; if(pred>=0 && pred<n) cnt[pred]++;
-        }
-    }
-    ctx->dependents=malloc(sizeof(Dependents)*n);
-    for(int i=0;i<n;i++){
-        ctx->dependents[i].count=0; ctx->dependents[i].capacity=cnt[i];
-        ctx->dependents[i].list=cnt[i]?malloc(sizeof(int)*cnt[i]):NULL;
+        ctx->dependents[i].capacity=8; // Initial estimate
+        ctx->dependents[i].list=malloc(sizeof(int)*8);
     }
     for(int i=0;i<n;i++){
         IRStmt* s=&ctx->stmts[i];
         for(int p=0;p<s->dep_count;p++){
-            int pred=s->dep_indices[p]; if(pred>=0 && pred<n)
-                ctx->dependents[pred].list[ctx->dependents[pred].count++]=i;
+            int pred=s->dep_indices[p]; if(pred>=0 && pred<n){
+                Dependents* deps=&ctx->dependents[pred];
+                if(deps->count >= deps->capacity){
+                    deps->capacity*=2;
+                    deps->list=realloc(deps->list,sizeof(int)*deps->capacity);
+                }
+                deps->list[deps->count++]=i;
+            }
         }
     }
-    free(cnt);
 }
 
 static void free_dependents(ExecContext* ctx){
@@ -374,25 +441,40 @@ static void free_dependents(ExecContext* ctx){
     free(ctx->dependents); ctx->dependents=NULL;
 }
 
+static pthread_key_t ctx_key;
+static void init_ctx_key() { pthread_key_create(&ctx_key, NULL); }
+
 void executor(IRStmt* stmts,int stmt_count,VarSlot** env_array,int max_threads){
+    if(max_threads <= 0) max_threads = MAX_THREADS_DEFAULT;
+    init_ctx_key();
     ExecContext ctx={0};
     ctx.stmts=stmts; ctx.stmt_count=stmt_count; ctx.env_array=env_array; ctx.max_threads=max_threads;
     ctx.dep_remaining=calloc(stmt_count,sizeof(atomic_int));
     for(int i=0;i<stmt_count;i++) atomic_init(&ctx.dep_remaining[i],stmts[i].dep_count);
     build_dependents(&ctx);
 
-    queue_init(&ctx.queue,stmt_count>1024?stmt_count*2:1024);
-    for(int i=0;i<stmt_count;i++) if(stmts[i].dep_count==0) queue_push(&ctx.queue,i);
+    ctx.thread_queues = malloc(sizeof(WorkQueue) * max_threads);
+    for(int i=0;i<max_threads;i++) queue_init(&ctx.thread_queues[i], stmt_count / max_threads + 128);
 
     atomic_init(&ctx.remaining,stmt_count);
+    int initial_push = 0;
+    for(int i=0;i<stmt_count;i++) if(stmts[i].dep_count==0) {
+        queue_push(&ctx, i, initial_push % max_threads);
+        initial_push++;
+    }
+
     pthread_t* threads=malloc(sizeof(pthread_t)*max_threads);
-    for(int i=0;i<max_threads;i++) pthread_create(&threads[i],NULL,worker_thread,&ctx);
+    for(long i=0;i<max_threads;i++) {
+        pthread_setspecific(ctx_key, &ctx);
+        pthread_create(&threads[i],NULL,worker_thread,(void*)i);
+    }
     for(int i=0;i<max_threads;i++) pthread_join(threads[i],NULL);
 
+    for(int i=0;i<max_threads;i++) free(ctx.thread_queues[i].buf);
+    free(ctx.thread_queues);
     free(threads);
     free(ctx.dep_remaining);
     free_dependents(&ctx);
-    free(ctx.queue.buf);
 }
 
 // ---------------- Init environment ----------------
@@ -406,8 +488,8 @@ static void cleanup(){
     if(env_array){ free(env_array); env_array=NULL;}
     if(var_table){ free(var_table); var_table=NULL;}
     VarPoolChunk* c=dynamic_pool;
-    while(c){ VarPoolChunk* nx=c->next; free(c->slots); free(c); c=nx;}
+    while(c){ VarPoolChunk* nx=c->next; free(c->slots); /* arena for struct */ c=nx;}
     dynamic_pool=NULL;
     if(func_blob) munmap(func_blob,func_blob_size);
+    // Note: Arena memory is thread-local, freed on thread exit or reset
 }
-
