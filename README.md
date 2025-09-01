@@ -1,19 +1,47 @@
 
-# Ɵ-Programming-Language
-Ɵ (Optivar) is an Declarative Intermediate Language (DIL) designed for prioritizing simplicity and performance through defining variables/arguments and using a comprehensive library of pre-defined, highly optimized functions. 
+# Ɵ-Programming-Language (Optivar)
 
-## Description
+Ɵ (Optivar) is a **Declarative Intermediate Language (DIL)** designed for **high-performance, modular, and hardware-aware computation**. It emphasizes **simplicity for practitioners** and **maximum flexibility for researchers** through a plugin-based binary ecosystem.
 
-This is essentially a “modular, plugin-based scripting language”: the core is tiny and stable, and all language features are optional binaries provided as a package. Users only get what they need, and the heavy lifting is done natively.
+---
 
-This programming language is created mainly to leave the manual function creation (operators such as additions, substractions, loops, conditionals, and other control structures) to researchers so that they can deal with the manual creation of the optimized functions via a minimalist turing complete instruction list (command/commands that have the same feature/features as the abstractions of "MOV", "ADD", "SUB", "CMP", "JMP") depending on "hardware infrastructure". 
+## Overview
 
-So the other practitioners of this programming language (non-researchers) do not need anything else than defining inputs/outputs as variables/arguments.
+Ɵ is a **tiny, stable core language** where every function is implemented as a separate, precompiled binary. Users download only the binaries they need, optimized for their **hardware infrastructure**.  
 
-Whole programming language has only 2 syntax structure:
+This design allows:
 
-1)  y1 = f( x1 , x2 , x3 , ... );   
-2)  -- comment 
+- Extremely **lightweight and fast execution**  
+- **Dynamic scheduling** of dependent tasks  
+- **Scalable orchestration** across multiple threads or nodes  
+
+Researchers can implement **low-level operations** (like arithmetic, control structures, loops, etc.) using a **minimalist Turing-complete instruction set**, while practitioners only need to define **inputs and outputs** as variables and orchestrate computations.
+
+---
+
+## Language Philosophy
+
+- **Minimal core, maximum flexibility:** Only essential syntax is built-in; all heavy operations are optional binaries.  
+- **Hardware-aware optimization:** Binaries are compiled for specific architectures for maximum performance.  
+- **Dynamic orchestration:** Runtime dependency management and scheduling are handled automatically.  
+- **Clear separation of roles:** Researchers build optimized functions; practitioners orchestrate workflows.  
+- **Extensible and modular:** Users can fetch new binaries from a marketplace depending on their computation needs.
+
+---
+
+## Syntax
+
+Ɵ has only **two constructs**:
+
+1. **Function call**
+```
+output = f(input1, input2, input3, ...);
+```
+
+2. **Function call** 
+```
+ -- comment 
+```
 
 For simplicity, it is translated to natural language as:
 
