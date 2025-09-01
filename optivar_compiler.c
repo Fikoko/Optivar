@@ -389,7 +389,6 @@ static void execute_single(IRStmt* s, ExecContext* ctx, long* args_buffer) {
         lhs->value = val; lhs->constant = 0;
     } else if (s->func_ptr) {
         int expected_argc;
-        if (get_func_ptr("dummy", &expected_argc)) {} // Placeholder; use actual name if needed
         if (expected_argc != -1 && s->argc != expected_argc) { /* Error */ return; }
         void (*fn)(long*, long*) = s->func_ptr;
         fn(&lhs->value, args_buffer);
