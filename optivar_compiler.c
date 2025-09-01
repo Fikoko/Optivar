@@ -1,4 +1,4 @@
-// optivar_orchestrator.c (superoptimized + adaptive unbounded)
+// optivar_orchestrator.c (fully adaptive + unbounded)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +19,6 @@
 #define FIXED_ARG_POOL 128
 #define INLINE_THRESHOLD 3
 #define MAX_NAME_LEN 128
-#define VAR_TABLE_SIZE 2048
 #define CACHE_LINE 64
 #define MAX_ARGS 16
 
@@ -64,22 +63,21 @@ static int var_count = 0;
 static int env_alloc_size = 0;
 
 // ---------------- Hash table ----------------
-static VarSlot* var_table[VAR_TABLE_SIZE];
+static VarSlot** var_table = NULL;
+static int var_table_size = 2048;
 
 // ---------------- Hash function ----------------
-static inline unsigned int hash_name(const char* s){
+static inline unsigned int hash_name(const char* s, int table_size){
     unsigned int h = 0;
     while(*s) h = (h * 31) + (unsigned char)(*s++);
-    return h % VAR_TABLE_SIZE;
+    return h % table_size;
 }
 
 // ---------------- Pool allocator ----------------
 static VarSlot* pool_alloc(){
     for(int i=0;i<fixed_top;i++){
         if(!fixed_pool[i].in_use){
-            fixed_pool[i].in_use=1;
-            fixed_pool[i].last_use=-1;
-            fixed_pool[i].constant=0;
+            fixed_pool[i].in_use=1; fixed_pool[i].last_use=-1; fixed_pool[i].constant=0;
             return &fixed_pool[i];
         }
     }
@@ -92,15 +90,12 @@ static VarSlot* pool_alloc(){
     while(chunk){
         for(int i=0;i<chunk->capacity;i++){
             if(!chunk->slots[i].in_use){
-                chunk->slots[i].in_use=1;
-                chunk->slots[i].last_use=-1;
-                chunk->slots[i].constant=0;
+                chunk->slots[i].in_use=1; chunk->slots[i].last_use=-1; chunk->slots[i].constant=0;
                 return &chunk->slots[i];
             }
         }
         chunk=chunk->next;
     }
-    // allocate new chunk dynamically
     int cap = VAR_CHUNK_SIZE;
     VarPoolChunk* new_chunk = malloc(sizeof(VarPoolChunk));
     if(!new_chunk){ perror("malloc VarPoolChunk"); exit(EXIT_FAILURE);}
@@ -132,41 +127,31 @@ static void preload_binfuncs(const char* dirpath){
     if(!dir){ perror("opendir"); return; }
     struct dirent* entry;
     size_t total_size=0;
-
     while((entry=readdir(dir))!=NULL){
         if(entry->d_type!=DT_REG) continue;
         size_t len=strlen(entry->d_name);
         if(len>4 && strcmp(entry->d_name+len-4,".bin")==0){
-            char path[512];
-            snprintf(path,sizeof(path),"%s/%s",dirpath,entry->d_name);
-            struct stat st;
-            if(stat(path,&st)==0) total_size+=(size_t)st.st_size;
+            char path[512]; snprintf(path,sizeof(path),"%s/%s",dirpath,entry->d_name);
+            struct stat st; if(stat(path,&st)==0) total_size+=st.st_size;
         }
     }
     closedir(dir);
     if(total_size==0) return;
-
     func_blob = mmap(NULL,total_size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE,-1,0);
     if(func_blob==MAP_FAILED){ perror("mmap func_blob"); func_blob=NULL; return; }
     func_blob_size = total_size;
 
-    dir=opendir(dirpath);
-    if(!dir){ perror("opendir"); return; }
+    dir=opendir(dirpath); if(!dir){ perror("opendir"); return; }
     size_t offset=0;
     while((entry=readdir(dir))!=NULL){
         if(entry->d_type!=DT_REG) continue;
         size_t len=strlen(entry->d_name);
         if(len>4 && strcmp(entry->d_name+len-4,".bin")==0){
-            char funcname[MAX_NAME_LEN];
-            strncpy(funcname,entry->d_name,len-4);
-            funcname[len-4]='\0';
+            char funcname[MAX_NAME_LEN]; strncpy(funcname,entry->d_name,len-4); funcname[len-4]='\0';
             char path[512]; snprintf(path,sizeof(path),"%s/%s",dirpath,entry->d_name);
-            FILE* f=fopen(path,"rb");
-            if(!f){ perror(path); continue;}
-            fseek(f,0,SEEK_END);
-            long flen=ftell(f); rewind(f);
-            fread(func_blob+offset,1,(size_t)flen,f);
-            fclose(f);
+            FILE* f=fopen(path,"rb"); if(!f){ perror(path); continue;}
+            fseek(f,0,SEEK_END); long flen=ftell(f); rewind(f);
+            fread(func_blob+offset,1,(size_t)flen,f); fclose(f);
             if(func_count>=256) break;
             strncpy(func_table[func_count].name,funcname,MAX_NAME_LEN-1);
             func_table[func_count].name[MAX_NAME_LEN-1]='\0';
@@ -178,11 +163,6 @@ static void preload_binfuncs(const char* dirpath){
         }
     }
     closedir(dir);
-}
-
-static void free_func_table(){
-    if(func_blob) munmap(func_blob,func_blob_size);
-    func_blob=NULL; func_blob_size=0; func_count=0;
 }
 
 // ---------------- IR ----------------
@@ -232,11 +212,28 @@ static void free_arg_blocks(){
     arg_blocks=NULL;
 }
 
-// ---------------- Variable table ----------------
+// ---------------- Dynamic var table ----------------
+static void grow_var_table(){
+    int new_size = var_table_size*2;
+    VarSlot** new_table = calloc(new_size,sizeof(VarSlot*));
+    for(int i=0;i<var_table_size;i++){
+        if(var_table[i]){
+            unsigned int h = hash_name((char*)var_table[i]->data,new_size);
+            for(int j=0;j<new_size;j++){
+                int idx=(h+j)%new_size;
+                if(!new_table[idx]){ new_table[idx]=var_table[i]; break;}
+            }
+        }
+    }
+    free(var_table);
+    var_table=new_table; var_table_size=new_size;
+}
+
 static int var_index(const char* name){
-    unsigned int h=hash_name(name);
-    for(int i=0;i<VAR_TABLE_SIZE;i++){
-        unsigned int idx=(h+i)%VAR_TABLE_SIZE;
+    if(!var_table){ var_table=calloc(var_table_size,sizeof(VarSlot*)); }
+    unsigned int h=hash_name(name,var_table_size);
+    for(int i=0;i<var_table_size;i++){
+        unsigned int idx=(h+i)%var_table_size;
         if(!var_table[idx]){
             VarSlot* slot=pool_alloc();
             slot->data=strdup(name);
@@ -253,102 +250,8 @@ static int var_index(const char* name){
             for(int j=0;j<var_count;j++) if(env_array[j]==var_table[idx]) return j;
         }
     }
-    // fallback dynamic hash growth could be implemented here if needed
-    return -1;
-}
-
-// ---------------- Parser ----------------
-static inline int is_space(char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; }
-
-static IRStmt parse_statement(char* stmt){
-    IRStmt s; memset(&s,0,sizeof(IRStmt));
-    char* comment=strstr(stmt,"--"); if(comment)*comment='\0';
-    while(*stmt && is_space(*stmt)) stmt++;
-    if(!*stmt) return s;
-    char* eq=strchr(stmt,'='); if(!eq) return s; *eq='\0';
-    char* lhs=stmt; while(is_space(*lhs)) lhs++;
-    char* lhs_end=lhs+strlen(lhs)-1; while(lhs_end>lhs && is_space(*lhs_end))*lhs_end--='\0';
-    s.lhs_index=var_index(lhs);
-    char* rhs=eq+1; while(*rhs && is_space(*rhs)) rhs++;
-    char* paren=strchr(rhs,'('); if(!paren) return s; *paren='\0';
-    char* funcname=rhs;
-    char* fend=funcname+strlen(funcname)-1; while(fend>funcname && is_space(*fend))*fend--='\0';
-    for(int i=0;i<func_count;i++){ if(strcmp(func_table[i].name,funcname)==0){ s.func_ptr=func_table[i].ptr; if(func_table[i].len<=INLINE_THRESHOLD)s.inlined=1; break;}}
-    char* args_str=paren+1;
-    char* close=strrchr(args_str,')'); if(!close) return s; *close='\0';
-    int arg_cap=16; s.arg_indices=arg_alloc(arg_cap); s.argc=0;
-    char* p=args_str;
-    while(*p){
-        while(is_space(*p)) p++;
-        if(*p==','){p++; continue;}
-        char* start=p; while(*p && *p!=',' && *p!=')') p++;
-        char* end=p-1; while(end>start && is_space(*end))*end--='\0';
-        if(p>start){
-            if(s.argc>=arg_cap){ arg_cap*=2; int* new_args=arg_alloc(arg_cap); memcpy(new_args,s.arg_indices,sizeof(int)*s.argc); s.arg_indices=new_args;}
-            char tmp[256]; int len=(int)(end-start+1); if(len>=256) len=255; memcpy(tmp,start,len); tmp[len]='\0';
-            char* t=tmp; while(is_space(*t)) t++;
-            s.arg_indices[s.argc++]=var_index(t);
-        }
-        if(*p==',') p++;
-    }
-    return s;
-}
-
-// ---------------- Optimizations ----------------
-static void constant_folding(IR* ir){
-    for(int i=0;i<ir->count;i++){
-        IRStmt* s=&ir->stmts[i];
-        if(s->dead || !s->func_ptr) continue;
-        int all_const=1; long val=0;
-        for(int j=0;j<s->argc;j++){
-            int ai=s->arg_indices[j];
-            if(ai<0 || ai>=var_count || !env_array[ai]->constant){ all_const=0; break;}
-            val+=env_array[ai]->value;
-        }
-        if(all_const){ env_array[s->lhs_index]->constant=1; env_array[s->lhs_index]->value=val; s->func_ptr=NULL;}
-    }
-}
-
-static void dead_code_elimination(IR* ir){
-    if(var_count==0) return;
-    int* used=calloc(var_count,sizeof(int));
-    for(int i=ir->count-1;i>=0;i--){
-        IRStmt* s=&ir->stmts[i];
-        if(!s->func_ptr) continue;
-        if(!used[s->lhs_index]) s->dead=1;
-        for(int j=0;j<s->argc;j++) used[s->arg_indices[j]]=1;
-    }
-    free(used);
-}
-
-static void ir_batching(IR* ir){
-    for(int i=0;i<ir->count-1;i++){
-        IRStmt* s=&ir->stmts[i]; if(s->dead||!s->func_ptr) continue;
-        IRStmt* next=&ir->stmts[i+1]; if(next->dead||!next->func_ptr) continue;
-        if(s->func_ptr==next->func_ptr){
-            int total=s->argc+next->argc; int* merged=arg_alloc(total);
-            memcpy(merged,s->arg_indices,sizeof(int)*s->argc);
-            memcpy(merged+s->argc,next->arg_indices,sizeof(int)*next->argc);
-            s->arg_indices=merged; s->argc=total; next->dead=1;
-        }
-    }
-}
-
-static void build_dependencies(IR* ir){
-    for(int i=0;i<ir->count;i++){
-        IRStmt* s=&ir->stmts[i]; s->dep_count=0; s->dep_indices=NULL; s->executed=0;
-        int dep_cap=4; int* deps=malloc(sizeof(int)*dep_cap); int deps_used=0;
-        for(int j=0;j<i;j++){
-            IRStmt* prev=&ir->stmts[j];
-            for(int k=0;k<s->argc;k++){
-                if(prev->lhs_index==s->arg_indices[k]){
-                    if(deps_used>=dep_cap){ dep_cap*=2; int* tmp=realloc(deps,sizeof(int)*dep_cap); deps=tmp;}
-                    deps[deps_used++]=j; break;
-                }
-            }
-        }
-        if(deps_used){ s->dep_indices=deps; s->dep_count=deps_used;} else free(deps);
-    }
+    grow_var_table();
+    return var_index(name);
 }
 
 // ---------------- Environment ----------------
@@ -358,7 +261,7 @@ static void init_env(int total_vars){
     memset(env_array,0,sizeof(VarSlot*)*env_alloc_size);
 }
 
-// ---------------- Executor ----------------
+// ---------------- Executor structures ----------------
 typedef struct Dependents {
     int* list;
     int capacity;
@@ -383,6 +286,7 @@ typedef struct ExecContext {
     WorkQueue queue;
 } ExecContext;
 
+// ---------------- Queue ----------------
 static void queue_init(WorkQueue* q, int capacity){
     q->buf=malloc(sizeof(int)*capacity);
     q->capacity=capacity;
@@ -402,6 +306,7 @@ static int queue_try_pop(WorkQueue* q,int* out){
     return 0;
 }
 
+// ---------------- Executor ----------------
 static void execute_single(IRStmt* s, ExecContext* ctx,long* args_buffer){
     if(s->dead || s->executed) return;
     for(int i=0;i<s->argc;i++){
@@ -470,19 +375,39 @@ static void free_dependents(ExecContext* ctx){
 }
 
 void executor(IRStmt* stmts,int stmt_count,VarSlot** env_array,int max_threads){
-    if(!stmts||stmt_count<=0) return;
-    if(max_threads<=0) max_threads=1;
-    ExecContext ctx; memset(&ctx,0,sizeof(ctx));
+    ExecContext ctx={0};
     ctx.stmts=stmts; ctx.stmt_count=stmt_count; ctx.env_array=env_array; ctx.max_threads=max_threads;
-    ctx.dep_remaining=malloc(sizeof(atomic_int)*stmt_count);
+    ctx.dep_remaining=calloc(stmt_count,sizeof(atomic_int));
     for(int i=0;i<stmt_count;i++) atomic_init(&ctx.dep_remaining[i],stmts[i].dep_count);
     build_dependents(&ctx);
-    atomic_init(&ctx.remaining,0);
-    for(int i=0;i<stmt_count;i++){ if(stmts[i].dead) stmts[i].executed=1; else atomic_fetch_add(&ctx.remaining,1);}
-    queue_init(&ctx.queue,stmt_count+8);
-    for(int i=0;i<stmt_count;i++) if(!stmts[i].dead && atomic_load(&ctx.dep_remaining[i])==0) queue_push(&ctx.queue,i);
+
+    queue_init(&ctx.queue,stmt_count>1024?stmt_count*2:1024);
+    for(int i=0;i<stmt_count;i++) if(stmts[i].dep_count==0) queue_push(&ctx.queue,i);
+
+    atomic_init(&ctx.remaining,stmt_count);
     pthread_t* threads=malloc(sizeof(pthread_t)*max_threads);
-    for(int t=0;t<max_threads;t++) pthread_create(&threads[t],NULL,worker_thread,&ctx);
-    for(int t=0;t<max_threads;t++) pthread_join(threads[t],NULL);
-    free(threads); free_dependents(&ctx); free(ctx.dep_remaining); free(ctx.queue.buf);
+    for(int i=0;i<max_threads;i++) pthread_create(&threads[i],NULL,worker_thread,&ctx);
+    for(int i=0;i<max_threads;i++) pthread_join(threads[i],NULL);
+
+    free(threads);
+    free(ctx.dep_remaining);
+    free_dependents(&ctx);
+    free(ctx.queue.buf);
 }
+
+// ---------------- Init environment ----------------
+static void init_full_env(int total_vars){
+    init_env(total_vars);
+}
+
+// ---------------- Cleanup ----------------
+static void cleanup(){
+    free_arg_blocks();
+    if(env_array){ free(env_array); env_array=NULL;}
+    if(var_table){ free(var_table); var_table=NULL;}
+    VarPoolChunk* c=dynamic_pool;
+    while(c){ VarPoolChunk* nx=c->next; free(c->slots); free(c); c=nx;}
+    dynamic_pool=NULL;
+    if(func_blob) munmap(func_blob,func_blob_size);
+}
+
