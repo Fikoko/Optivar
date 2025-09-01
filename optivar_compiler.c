@@ -12,24 +12,30 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <fcntl.h>
-#include <sys/sysinfo.h> // For sysconf(_SC_NPROCESSORS_ONLN)
+#include <sys/sysinfo.h>
+#include <zlib.h>
 
 #define MAX_IR 8192
-#define DEFAULT_FIXED_VARS 4096 // Configurable via --fixed-vars
+#define DEFAULT_FIXED_VARS 4096
 #define VAR_CHUNK_SIZE 8192
 #define FIXED_ARG_POOL 256
 #define MAX_NAME_LEN 128
 #define CACHE_LINE 64
 #define MAX_ARGS 16
-#define MAX_THREADS_DEFAULT 8 // Fallback if sysconf fails
-#define MIN_BIN_SIZE 16 // Minimum .bin file size for validation
+#define MAX_THREADS_DEFAULT 8
+#define MIN_BIN_SIZE 16 // Minimum code size (excluding header)
+#define BIN_MAGIC 0xDEADBEEF // Magic number for .bin file validation
 
-// ---------------- Command-line Options ----------------
+// Command-line Options
 static int FIXED_VARS = DEFAULT_FIXED_VARS;
-static int var_table_size = 2048; // Configurable via --table-size
-static int single_threaded = 0; // Flag for single-threaded mode
+static int var_table_size = 2048;
+static int single_threaded = 0;
 
-// ---------------- VarSlot ----------------
+// Global mutexes
+static pthread_mutex_t var_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t func_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// VarSlot
 typedef struct VarSlot {
     void* data; // Variable name
     int in_use;
@@ -39,7 +45,7 @@ typedef struct VarSlot {
     char pad[CACHE_LINE - sizeof(void*) - 4*sizeof(int) - sizeof(long)];
 } VarSlot;
 
-// ---------------- IRStmt ----------------
+// IRStmt
 typedef struct IRStmt {
     int lhs_index;
     void* func_ptr;
@@ -53,8 +59,8 @@ typedef struct IRStmt {
     char pad[CACHE_LINE - 9*sizeof(int) - sizeof(void*) - sizeof(int*)];
 } IRStmt;
 
-// ---------------- Pools ----------------
-static VarSlot* fixed_pool = NULL; // Dynamically allocated based on FIXED_VARS
+// Pools
+static VarSlot* fixed_pool = NULL;
 static int fixed_top = 0;
 
 typedef struct VarPoolChunk {
@@ -64,12 +70,12 @@ typedef struct VarPoolChunk {
 } VarPoolChunk;
 static VarPoolChunk* dynamic_pool = NULL;
 
-// ---------------- Environment ----------------
+// Environment
 static VarSlot** env_array = NULL;
 static int var_count = 0;
 static int env_alloc_size = 0;
 
-// ---------------- Hash Table (Chained) ----------------
+// Hash Table (Chained)
 typedef struct HashNode {
     VarSlot* slot;
     char* name;
@@ -77,16 +83,15 @@ typedef struct HashNode {
 } HashNode;
 
 static HashNode** var_table = NULL;
-static pthread_mutex_t var_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ---------------- Hash Function ----------------
+// Hash Function
 static inline unsigned int hash_name(const char* s, int table_size) {
     unsigned int h = 0;
     while (*s) h = (h * 31) + (unsigned char)(*s++);
     return h % table_size;
 }
 
-// ---------------- Arena Allocator ----------------
+// Arena Allocator
 static __thread char* arena_ptr = NULL;
 static __thread size_t arena_size = 0;
 
@@ -95,7 +100,7 @@ static void* arena_alloc(size_t size) {
         size_t new_size = size > 65536 ? size : 65536;
         char* new_arena = aligned_alloc(CACHE_LINE, new_size);
         if (!new_arena) { perror("aligned_alloc arena"); exit(EXIT_FAILURE); }
-        if (arena_ptr) free(arena_ptr); // Free old arena
+        if (arena_ptr) free(arena_ptr);
         arena_ptr = new_arena;
         arena_size = new_size;
     }
@@ -106,12 +111,12 @@ static void* arena_alloc(size_t size) {
 }
 
 static void arena_reset() {
-    if (arena_ptr) free(arena_ptr); // Free arena memory
+    if (arena_ptr) free(arena_ptr);
     arena_ptr = NULL;
     arena_size = 0;
 }
 
-// ---------------- Pool Allocator ----------------
+// Pool Allocator
 static VarSlot* pool_alloc() {
     for (int i = 0; i < fixed_top; i++) {
         if (!fixed_pool[i].in_use) {
@@ -153,33 +158,39 @@ static VarSlot* pool_alloc() {
     return &new_chunk->slots[0];
 }
 
-// ---------------- Function Table ----------------
+// Function Table
 typedef struct {
     char name[MAX_NAME_LEN];
     void* ptr;
-    size_t len;
-    size_t offset;
+    size_t len; // Size of mapped code
     int arg_count;
 } FuncEntry;
 
 static FuncEntry* func_table = NULL;
 static int func_table_size = 256;
 static int func_count = 0;
-static char* func_blob = NULL;
-static size_t func_blob_size = 0;
 
-// ---------------- Dynamic Function Table ----------------
+// Dynamic Function Table
 static void grow_func_table() {
+    pthread_mutex_lock(&func_table_mutex);
     int new_size = func_table_size * 2;
     FuncEntry* new_table = realloc(func_table, sizeof(FuncEntry) * new_size);
     if (!new_table) { perror("realloc func_table"); exit(EXIT_FAILURE); }
     memset(new_table + func_table_size, 0, sizeof(FuncEntry) * (new_size - func_table_size));
     func_table = new_table;
     func_table_size = new_size;
+    pthread_mutex_unlock(&func_table_mutex);
 }
 
-// ---------------- Lazy Load .bin Functions ----------------
-static void* load_binfunc(const char* name, int* arg_count_out) {
+// .bin File Validation
+typedef struct {
+    uint32_t magic;     // e.g., 0xDEADBEEF
+    int arg_count;      // Expected number of arguments
+    uint32_t code_crc;  // CRC32 of code section
+    uint32_t code_size; // Size of code section
+} BinHeader;
+
+static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out) {
     char path[512];
     snprintf(path, sizeof(path), "./funcs/%s.bin", name);
     struct stat st;
@@ -187,7 +198,7 @@ static void* load_binfunc(const char* name, int* arg_count_out) {
         fprintf(stderr, "Error: Function file %s not found\n", path);
         return NULL;
     }
-    if (st.st_size < MIN_BIN_SIZE) {
+    if (st.st_size < sizeof(BinHeader) + MIN_BIN_SIZE) {
         fprintf(stderr, "Error: Function file %s too small (%ld bytes)\n", path, st.st_size);
         return NULL;
     }
@@ -196,17 +207,65 @@ static void* load_binfunc(const char* name, int* arg_count_out) {
         fprintf(stderr, "Error: Failed to open %s\n", path);
         return NULL;
     }
-    void* ptr = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    BinHeader header;
+    if (read(fd, &header, sizeof(BinHeader)) != sizeof(BinHeader)) {
+        fprintf(stderr, "Error: Failed to read header from %s\n", path);
+        close(fd);
+        return NULL;
+    }
+    if (header.magic != BIN_MAGIC) {
+        fprintf(stderr, "Error: Invalid magic number in %s (got 0x%x, expected 0x%x)\n",
+                path, header.magic, BIN_MAGIC);
+        close(fd);
+        return NULL;
+    }
+    if (header.arg_count < 0) {
+        fprintf(stderr, "Error: Invalid arg_count in %s (%d)\n", path, header.arg_count);
+        close(fd);
+        return NULL;
+    }
+    if (header.code_size != st.st_size - sizeof(BinHeader)) {
+        fprintf(stderr, "Error: Invalid code_size in %s (got %u, expected %ld)\n",
+                path, header.code_size, st.st_size - sizeof(BinHeader));
+        close(fd);
+        return NULL;
+    }
+    char* code = malloc(header.code_size);
+    if (!code) {
+        fprintf(stderr, "Error: Failed to allocate buffer for %s\n", path);
+        close(fd);
+        return NULL;
+    }
+    if (read(fd, code, header.code_size) != header.code_size) {
+        fprintf(stderr, "Error: Failed to read code from %s\n", path);
+        free(code);
+        close(fd);
+        return NULL;
+    }
+    uint32_t computed_crc = crc32(0, (unsigned char*)code, header.code_size);
+    if (computed_crc != header.code_crc) {
+        fprintf(stderr, "Error: Invalid CRC32 in %s (got 0x%x, expected 0x%x)\n",
+                path, computed_crc, header.code_crc);
+        free(code);
+        close(fd);
+        return NULL;
+    }
+    lseek(fd, sizeof(BinHeader), SEEK_SET); // Reset for mmap
+    void* ptr = mmap(NULL, header.code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE, fd, sizeof(BinHeader));
+    free(code);
     close(fd);
     if (ptr == MAP_FAILED) {
         fprintf(stderr, "Error: Failed to mmap %s\n", path);
         return NULL;
     }
-    *arg_count_out = -1; // Placeholder; no metadata parsing
+    *arg_count_out = header.arg_count;
+    *len_out = header.code_size;
     return ptr;
 }
 
 static void preload_binfuncs(const char* dirpath) {
+    pthread_mutex_lock(&func_table_mutex);
     if (!func_table) {
         func_table = calloc(func_table_size, sizeof(FuncEntry));
         if (!func_table) { perror("calloc func_table"); exit(EXIT_FAILURE); }
@@ -214,6 +273,7 @@ static void preload_binfuncs(const char* dirpath) {
     DIR* dir = opendir(dirpath);
     if (!dir) {
         fprintf(stderr, "Error: Failed to open directory %s\n", dirpath);
+        pthread_mutex_unlock(&func_table_mutex);
         return;
     }
     struct dirent* entry;
@@ -225,37 +285,47 @@ static void preload_binfuncs(const char* dirpath) {
             char funcname[MAX_NAME_LEN];
             strncpy(funcname, entry->d_name, len - 4);
             funcname[len - 4] = '\0';
+            if (strlen(funcname) >= MAX_NAME_LEN) {
+                fprintf(stderr, "Error: Function name %s too long\n", funcname);
+                continue;
+            }
             strncpy(func_table[func_count].name, funcname, MAX_NAME_LEN - 1);
             func_table[func_count].name[MAX_NAME_LEN - 1] = '\0';
-            func_table[func_count].ptr = NULL; // Lazy load
+            func_table[func_count].ptr = NULL;
             func_table[func_count].len = 0;
-            func_table[func_count].offset = 0;
             func_table[func_count].arg_count = -1;
             func_count++;
         }
     }
     closedir(dir);
+    pthread_mutex_unlock(&func_table_mutex);
 }
 
-static void* get_func_ptr(const char* name, int* arg_count_out) {
+static void* get_func_ptr(const char* name, int* arg_count_out, size_t* len_out) {
+    pthread_mutex_lock(&func_table_mutex);
     for (int i = 0; i < func_count; i++) {
         if (strcmp(func_table[i].name, name) == 0) {
             if (!func_table[i].ptr) {
-                func_table[i].ptr = load_binfunc(name, &func_table[i].arg_count);
+                func_table[i].ptr = load_binfunc(name, &func_table[i].arg_count, &func_table[i].len);
                 if (!func_table[i].ptr) {
                     fprintf(stderr, "Warning: Failed to load function %s\n", name);
                 }
             }
             *arg_count_out = func_table[i].arg_count;
-            return func_table[i].ptr;
+            *len_out = func_table[i].len;
+            void* ptr = func_table[i].ptr;
+            pthread_mutex_unlock(&func_table_mutex);
+            return ptr;
         }
     }
     fprintf(stderr, "Error: Function %s not found in func_table\n", name);
     *arg_count_out = -1;
+    *len_out = 0;
+    pthread_mutex_unlock(&func_table_mutex);
     return NULL;
 }
 
-// ---------------- IR ----------------
+// IR
 typedef struct IR {
     IRStmt* stmts;
     int count;
@@ -277,7 +347,7 @@ static IRStmt* ir_alloc_stmt(IR* ir) {
     return s;
 }
 
-// ---------------- ArgBlock ----------------
+// ArgBlock
 typedef struct ArgBlock {
     int* args;
     int capacity;
@@ -311,8 +381,9 @@ static void free_arg_blocks() {
     arg_blocks = NULL; // Arena-based, no explicit free
 }
 
-// ---------------- Dynamic Var Table ----------------
+// Dynamic Var Table
 static void grow_var_table() {
+    pthread_mutex_lock(&var_table_mutex);
     int new_size = var_table_size * 2;
     HashNode** new_table = calloc(new_size, sizeof(HashNode*));
     if (!new_table) { perror("calloc var_table"); exit(EXIT_FAILURE); }
@@ -329,6 +400,7 @@ static void grow_var_table() {
     free(var_table);
     var_table = new_table;
     var_table_size = new_size;
+    pthread_mutex_unlock(&var_table_mutex);
 }
 
 static int var_index(const char* name) {
@@ -368,7 +440,7 @@ static int var_index(const char* name) {
     return idx;
 }
 
-// ---------------- Environment ----------------
+// Environment
 static void init_env(int total_vars) {
     env_alloc_size = total_vars > 0 ? total_vars : (FIXED_VARS * 2);
     env_array = aligned_alloc(CACHE_LINE, sizeof(VarSlot*) * env_alloc_size);
@@ -379,7 +451,7 @@ static void init_env(int total_vars) {
     memset(fixed_pool, 0, sizeof(VarSlot) * FIXED_VARS);
 }
 
-// ---------------- Executor Structures ----------------
+// Executor Structures
 typedef struct Dependents {
     int* list;
     int capacity;
@@ -404,7 +476,7 @@ typedef struct ExecContext {
     WorkQueue* thread_queues;
 } ExecContext;
 
-// ---------------- Queue ----------------
+// Queue
 static void queue_init(WorkQueue* q, int capacity) {
     q->buf = aligned_alloc(CACHE_LINE, sizeof(int) * capacity);
     if (!q->buf) { perror("aligned_alloc queue"); exit(EXIT_FAILURE); }
@@ -446,7 +518,7 @@ static int steal_work(ExecContext* ctx, int* out, int thread_id) {
     return 0;
 }
 
-// ---------------- Executor ----------------
+// Executor
 static void execute_single(IRStmt* s, ExecContext* ctx, long* args_buffer) {
     if (s->dead || s->executed) return;
     for (int i = 0; i < s->argc; i++) {
@@ -457,11 +529,13 @@ static void execute_single(IRStmt* s, ExecContext* ctx, long* args_buffer) {
     VarSlot* lhs = ctx->env_array[s->lhs_index];
     if (s->inlined) {
         long val = 0;
-        for (int i = 0; i < s->argc; i++) val += args_buffer[i]; // Generic sum
+        for (int i = 0; i < s->argc; i++) val += args_buffer[i];
         lhs->value = val;
         lhs->constant = 0;
     } else if (s->func_ptr) {
-        int expected_argc = -1; // Placeholder
+        int expected_argc = -1;
+        size_t len;
+        get_func_ptr((char*)ctx->env_array[s->lhs_index]->data, &expected_argc, &len);
         if (expected_argc != -1 && s->argc != expected_argc) {
             fprintf(stderr, "Error: Function at stmt %d expects %d args, got %d\n",
                     (int)(s - ctx->stmts), expected_argc, s->argc);
@@ -548,7 +622,7 @@ static pthread_key_t ctx_key;
 static void init_ctx_key() { pthread_key_create(&ctx_key, NULL); }
 
 void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array, int max_threads) {
-    if (single_threaded) max_threads = 1; // Override for single-threaded mode
+    if (single_threaded) max_threads = 1;
     init_ctx_key();
     ExecContext ctx = {0};
     ctx.stmts = stmts;
@@ -561,8 +635,8 @@ void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array, int max_thread
     build_dependents(&ctx);
 
     ctx.thread_queues = malloc(sizeof(WorkQueue) * max_threads);
-    if (!ctx.thread_queues) { perror("malloc thread_queues"); exit(EXIT_FAILURE); }
-    for (int i = 0; i < max_threads; i++) queue_init(&ctx->thread_queues[i], stmt_count / max_threads + 128);
+    if (!ctx->thread_queues) { perror("malloc thread_queues"); exit(EXIT_FAILURE); }
+    for (int i = 0; i < max_threads; i++) queue_init(&ctx.thread_queues[i], stmt_count / max_threads + 128);
 
     atomic_init(&ctx->remaining, stmt_count);
     int initial_push = 0;
@@ -588,7 +662,7 @@ void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array, int max_thread
     free_dependents(&ctx);
 }
 
-// ---------------- Dependency Analysis ----------------
+// Dependency Analysis
 static void compute_dependencies(IR* ir) {
     for (int i = 0; i < ir->count; i++) {
         IRStmt* stmt = &ir->stmts[i];
@@ -610,12 +684,12 @@ static void compute_dependencies(IR* ir) {
     }
 }
 
-// ---------------- Init Environment ----------------
+// Init Environment
 static void init_full_env(int total_vars) {
     init_env(total_vars);
 }
 
-// ---------------- Cleanup ----------------
+// Cleanup
 static void cleanup() {
     free_arg_blocks();
     if (env_array) {
@@ -630,38 +704,49 @@ static void cleanup() {
             HashNode* node = var_table[i];
             while (node) {
                 HashNode* next = node->next;
-                node = next; // No free; arena-based
+                node = next; // Arena-based
             }
         }
         free(var_table);
         var_table = NULL;
     }
+    if (fixed_pool) {
+        free(fixed_pool);
+        fixed_pool = NULL;
+    }
     VarPoolChunk* c = dynamic_pool;
     while (c) {
         VarPoolChunk* nx = c->next;
-        free(c->slots); // Free slots
-        c = nx; // Arena-based struct
+        if (c->slots) free(c->slots);
+        c = nx;
     }
     dynamic_pool = NULL;
-    if (func_blob) munmap(func_blob, func_blob_size);
     if (func_table) {
         for (int i = 0; i < func_count; i++) {
-            if (func_table[i].ptr) munmap(func_table[i].ptr, func_table[i].len);
+            if (func_table[i].ptr && func_table[i].len > 0) {
+                munmap(func_table[i].ptr, func_table[i].len);
+            }
         }
         free(func_table);
         func_table = NULL;
     }
     arena_reset();
+    pthread_mutex_destroy(&var_table_mutex);
+    pthread_mutex_destroy(&func_table_mutex);
 }
 
-// ---------------- Parser ----------------
+// atexit Handler
+static void atexit_cleanup() {
+    cleanup();
+}
+
+// Parser
 static IRStmt* parse_line(const char* line, IR* ir, int stmt_idx) {
     while (isspace(*line)) line++;
     if (*line == '\0' || strncmp(line, "--", 2) == 0) return NULL;
 
     char lhs_name[MAX_NAME_LEN] = {0};
     char func_name[MAX_NAME_LEN] = {0};
-    char args_buf[1024];
     int arg_count = 0;
     int arg_indices[MAX_ARGS];
 
@@ -673,7 +758,7 @@ static IRStmt* parse_line(const char* line, IR* ir, int stmt_idx) {
     size_t lhs_len = eq - line;
     while (lhs_len > 0 && isspace(line[lhs_len - 1])) lhs_len--;
     if (lhs_len >= MAX_NAME_LEN) {
-        fprintf(stderr, "Error: LHS name too long: %s\n", line);
+        fprintf(stderr, "Error: LHS name too long: %.*s\n", (int)lhs_len, line);
         return NULL;
     }
     strncpy(lhs_name, line, lhs_len);
@@ -689,17 +774,15 @@ static IRStmt* parse_line(const char* line, IR* ir, int stmt_idx) {
     size_t func_len = paren - eq - 1;
     while (func_len > 0 && isspace(*(eq + 1 + func_len - 1))) func_len--;
     if (func_len >= MAX_NAME_LEN) {
-        fprintf(stderr, "Error: Function name too long: %s\n", line);
+        fprintf(stderr, "Error: Function name too long: %.*s\n", (int)func_len, eq + 1);
         return NULL;
     }
     strncpy(func_name, eq + 1, func_len);
     func_name[func_len] = '\0';
 
     size_t args_len = semi - paren - 1;
-    if (args_len >= 1024) {
-        fprintf(stderr, "Error: Arguments too long: %s\n", line);
-        return NULL;
-    }
+    char* args_buf = malloc(args_len + 1);
+    if (!args_buf) { perror("malloc args_buf"); exit(EXIT_FAILURE); }
     strncpy(args_buf, paren + 1, args_len);
     args_buf[args_len] = '\0';
 
@@ -708,16 +791,25 @@ static IRStmt* parse_line(const char* line, IR* ir, int stmt_idx) {
         while (isspace(*tok)) tok++;
         char* end = tok + strlen(tok) - 1;
         while (end > tok && isspace(*end)) { *end = '\0'; end--; }
-        if (*tok) arg_indices[arg_count++] = var_index(tok);
+        if (*tok) {
+            if (strlen(tok) >= MAX_NAME_LEN) {
+                fprintf(stderr, "Error: Argument name too long: %s\n", tok);
+                free(args_buf);
+                return NULL;
+            }
+            arg_indices[arg_count++] = var_index(tok);
+        }
         tok = strtok(NULL, ",");
     }
+    free(args_buf);
 
     IRStmt* stmt = ir_alloc_stmt(ir);
     stmt->lhs_index = var_index(lhs_name);
     stmt->argc = arg_count;
     stmt->arg_indices = arg_alloc(arg_count);
     memcpy(stmt->arg_indices, arg_indices, sizeof(int) * arg_count);
-    stmt->func_ptr = get_func_ptr(func_name, &stmt->arg_count);
+    size_t len;
+    stmt->func_ptr = get_func_ptr(func_name, &stmt->arg_count, &len);
     stmt->inlined = 0;
     stmt->dep_count = 0;
     stmt->dep_indices = NULL;
@@ -730,22 +822,25 @@ static IR* parse_script_file(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "Error: Failed to open script %s\n", path);
+        cleanup();
         return NULL;
     }
     IR* ir = malloc(sizeof(IR));
-    if (!ir) { perror("malloc IR"); fclose(f); return NULL; }
+    if (!ir) { perror("malloc IR"); fclose(f); cleanup(); return NULL; }
     ir_init(ir);
-    char line[1024];
+    char* line = NULL;
+    size_t line_size = 0;
     int stmt_idx = 0;
-    while (fgets(line, sizeof(line), f)) {
+    while (getline(&line, &line_size, f) != -1) {
         parse_line(line, ir, stmt_idx++);
     }
+    free(line);
     fclose(f);
-    compute_dependencies(ir); // Compute dependencies after parsing
+    compute_dependencies(ir);
     return ir;
 }
 
-// ---------------- Parse Command-Line Arguments ----------------
+// Parse Command-Line Arguments
 static void parse_args(int argc, char** argv, char** script_path, int* max_threads) {
     *script_path = NULL;
     *max_threads = sysconf(_SC_NPROCESSORS_ONLN);
@@ -767,12 +862,14 @@ static void parse_args(int argc, char** argv, char** script_path, int* max_threa
 
     if (!*script_path) {
         fprintf(stderr, "Usage: %s <script.optivar> [--single-thread] [--fixed-vars=N] [--table-size=N]\n", argv[0]);
+        cleanup();
         exit(EXIT_FAILURE);
     }
 }
 
-// ---------------- Main ----------------
+// Main
 int main(int argc, char** argv) {
+    atexit(atexit_cleanup); // Ensure cleanup on exit
     char* script_path;
     int max_threads;
     parse_args(argc, argv, &script_path, &max_threads);
@@ -780,7 +877,6 @@ int main(int argc, char** argv) {
     preload_binfuncs("./funcs");
     IR* ir = parse_script_file(script_path);
     if (!ir) {
-        fprintf(stderr, "Failed to parse script %s\n", script_path);
         cleanup();
         return 1;
     }
@@ -793,8 +889,8 @@ int main(int argc, char** argv) {
         printf("%s = %ld\n", (char*)v->data, v->value);
     }
 
-    cleanup();
     free(ir->stmts);
     free(ir);
+    cleanup();
     return 0;
 }
