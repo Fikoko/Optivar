@@ -37,7 +37,7 @@ static pthread_mutex_t func_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // VarSlot
 typedef struct VarSlot {
-    void* data; // Variable name
+    void* data; // Variable name or pointer storage
     int in_use;
     int last_use;
     int constant;
@@ -123,6 +123,8 @@ static VarSlot* pool_alloc() {
             fixed_pool[i].in_use = 1;
             fixed_pool[i].last_use = -1;
             fixed_pool[i].constant = 0;
+            fixed_pool[i].data = NULL;
+            fixed_pool[i].value = 0;
             return &fixed_pool[i];
         }
     }
@@ -131,6 +133,8 @@ static VarSlot* pool_alloc() {
         slot->in_use = 1;
         slot->last_use = -1;
         slot->constant = 0;
+        slot->data = NULL;
+        slot->value = 0;
         return slot;
     }
     VarPoolChunk* chunk = dynamic_pool;
@@ -140,6 +144,8 @@ static VarSlot* pool_alloc() {
                 chunk->slots[i].in_use = 1;
                 chunk->slots[i].last_use = -1;
                 chunk->slots[i].constant = 0;
+                chunk->slots[i].data = NULL;
+                chunk->slots[i].value = 0;
                 return &chunk->slots[i];
             }
         }
@@ -152,6 +158,7 @@ static VarSlot* pool_alloc() {
     new_chunk->capacity = cap;
     new_chunk->next = dynamic_pool;
     dynamic_pool = new_chunk;
+    memset(new_chunk->slots, 0, cap * sizeof(VarSlot));
     new_chunk->slots[0].in_use = 1;
     new_chunk->slots[0].last_use = -1;
     new_chunk->slots[0].constant = 0;
@@ -236,7 +243,13 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
         close(fd);
         return NULL;
     }
-    if (read(fd, code, header.code_size) != header.code_size) {
+    if (lseek(fd, sizeof(BinHeader), SEEK_SET) < 0) {
+        perror("lseek");
+        free(code);
+        close(fd);
+        return NULL;
+    }
+    if (read(fd, code, header.code_size) != (ssize_t)header.code_size) {
         fprintf(stderr, "Error: Failed to read code from %s\n", path);
         free(code);
         close(fd);
@@ -250,7 +263,7 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
         close(fd);
         return NULL;
     }
-    lseek(fd, sizeof(BinHeader), SEEK_SET); // Reset for mmap
+    /* Map the code section executable */
     void* ptr = mmap(NULL, header.code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE, fd, sizeof(BinHeader));
     free(code);
@@ -278,7 +291,7 @@ static void preload_binfuncs(const char* dirpath) {
     }
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_REG) continue;
+        if (entry->d_type != DT_REG && entry->d_type != DT_UNKNOWN) continue;
         size_t len = strlen(entry->d_name);
         if (len > 4 && strcmp(entry->d_name + len - 4, ".bin") == 0) {
             if (func_count >= func_table_size) grow_func_table();
@@ -521,39 +534,58 @@ static int steal_work(ExecContext* ctx, int* out, int thread_id) {
 // Executor
 static void execute_single(IRStmt* s, ExecContext* ctx, long* args_buffer) {
     if (s->dead || s->executed) return;
+    // Gather args
     for (int i = 0; i < s->argc; i++) {
         int ai = s->arg_indices[i];
         VarSlot* arg = ctx->env_array[ai];
-        args_buffer[i] = arg->constant ? arg->value : (long)arg->data;
+        if (!arg) {
+            args_buffer[i] = 0;
+        } else {
+            args_buffer[i] = arg->constant ? arg->value : (long)arg->data;
+        }
     }
     VarSlot* lhs = ctx->env_array[s->lhs_index];
+    if (!lhs) {
+        fprintf(stderr, "Error: LHS variable slot missing at stmt %p\n", (void*)s);
+        return;
+    }
+
     if (s->inlined) {
         long val = 0;
-        for (int i = 0; i < s->argc; i++) val += args_buffer[i];
-        lhs->value = val;
-        lhs->constant = 0;
-    } else if (s->func_ptr) {
-        int expected_argc = -1;
-        size_t len;
-        get_func_ptr((char*)ctx->env_array[s->lhs_index]->data, &expected_argc, &len);
-        if (expected_argc != -1 && s->argc != expected_argc) {
-            fprintf(stderr, "Error: Function at stmt %d expects %d args, got %d\n",
-                    (int)(s - ctx->stmts), expected_argc, s->argc);
-            return;
+        int all_const = 1;
+        for (int i = 0; i < s->argc; i++) {
+            int ai = s->arg_indices[i];
+            VarSlot* arg = ctx->env_array[ai];
+            if (!arg || !arg->constant) all_const = 0;
+            val += args_buffer[i];
         }
+        lhs->value = val;
+        lhs->constant = all_const;
+    } else if (s->func_ptr) {
+        /* s->func_ptr expected to be a function of signature void fn(long *out, long *args) */
         void (*fn)(long*, long*) = s->func_ptr;
         fn(&lhs->value, args_buffer);
         lhs->constant = 0;
     } else {
-        fprintf(stderr, "Error: No function pointer for stmt %d\n", (int)(s - ctx->stmts));
+        fprintf(stderr, "Error: No function pointer for stmt %ld\n", (long)(s - ctx->stmts));
         return;
     }
     s->executed = 1;
 }
 
+typedef struct WorkerArg {
+    ExecContext* ctx;
+    int tid;
+} WorkerArg;
+
+static pthread_key_t ctx_key;
+static void init_ctx_key() { pthread_key_create(&ctx_key, NULL); }
+
 static void* worker_thread(void* arg) {
-    long tid = (long)arg;
-    ExecContext* ctx = (ExecContext*)pthread_getspecific(ctx_key);
+    WorkerArg* wa = (WorkerArg*)arg;
+    ExecContext* ctx = wa->ctx;
+    int tid = wa->tid;
+    pthread_setspecific(ctx_key, ctx);
     long args_buffer[MAX_ARGS];
     int idx;
     while (atomic_load(&ctx->remaining) > 0) {
@@ -564,7 +596,7 @@ static void* worker_thread(void* arg) {
             for (int di = 0; di < deps->count; di++) {
                 int d = deps->list[di];
                 int prev = atomic_fetch_sub(&ctx->dep_remaining[d], 1);
-                if (prev == 1) queue_push(ctx, d, tid % ctx->max_threads);
+                if (prev == 1) queue_push(ctx, d, (tid) % ctx->max_threads);
             }
         } else if (steal_work(ctx, &idx, tid)) {
             execute_single(&ctx->stmts[idx], ctx, args_buffer);
@@ -591,6 +623,7 @@ static void build_dependents(ExecContext* ctx) {
         ctx->dependents[i].capacity = 8;
         ctx->dependents[i].list = malloc(sizeof(int) * 8);
         if (!ctx->dependents[i].list) { perror("malloc dependents list"); exit(EXIT_FAILURE); }
+        ctx->dependents[i].count = 0;
     }
     for (int i = 0; i < n; i++) {
         IRStmt* s = &ctx->stmts[i];
@@ -618,27 +651,26 @@ static void free_dependents(ExecContext* ctx) {
     ctx->dependents = NULL;
 }
 
-static pthread_key_t ctx_key;
-static void init_ctx_key() { pthread_key_create(&ctx_key, NULL); }
-
-void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array, int max_threads) {
+void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array_param, int max_threads) {
     if (single_threaded) max_threads = 1;
     init_ctx_key();
+    ExecContext* pctx = malloc(sizeof(ExecContext));
+    if (!pctx) { perror("malloc ExecContext"); exit(EXIT_FAILURE); }
     ExecContext ctx = {0};
     ctx.stmts = stmts;
     ctx.stmt_count = stmt_count;
-    ctx.env_array = env_array;
+    ctx.env_array = env_array_param;
     ctx.max_threads = max_threads;
     ctx.dep_remaining = calloc(stmt_count, sizeof(atomic_int));
     if (!ctx.dep_remaining) { perror("calloc dep_remaining"); exit(EXIT_FAILURE); }
-    for (int i = 0; i < stmt_count; i++) atomic_init(&ctx->dep_remaining[i], stmts[i].dep_count);
+    for (int i = 0; i < stmt_count; i++) atomic_init(&ctx.dep_remaining[i], stmts[i].dep_count);
     build_dependents(&ctx);
 
     ctx.thread_queues = malloc(sizeof(WorkQueue) * max_threads);
-    if (!ctx->thread_queues) { perror("malloc thread_queues"); exit(EXIT_FAILURE); }
+    if (!ctx.thread_queues) { perror("malloc thread_queues"); exit(EXIT_FAILURE); }
     for (int i = 0; i < max_threads; i++) queue_init(&ctx.thread_queues[i], stmt_count / max_threads + 128);
 
-    atomic_init(&ctx->remaining, stmt_count);
+    atomic_init(&ctx.remaining, stmt_count);
     int initial_push = 0;
     for (int i = 0; i < stmt_count; i++) {
         if (stmts[i].dep_count == 0) {
@@ -649,17 +681,28 @@ void executor(IRStmt* stmts, int stmt_count, VarSlot** env_array, int max_thread
 
     pthread_t* threads = malloc(sizeof(pthread_t) * max_threads);
     if (!threads) { perror("malloc threads"); exit(EXIT_FAILURE); }
+
+    // create worker args so each thread gets ctx and tid
+    WorkerArg* wargs = malloc(sizeof(WorkerArg) * max_threads);
+    if (!wargs) { perror("malloc wargs"); exit(EXIT_FAILURE); }
+
     for (long i = 0; i < max_threads; i++) {
-        pthread_setspecific(ctx_key, &ctx);
-        pthread_create(&threads[i], NULL, worker_thread, (void*)i);
+        wargs[i].ctx = &ctx;
+        wargs[i].tid = (int)i;
+        if (pthread_create(&threads[i], NULL, worker_thread, &wargs[i]) != 0) {
+            perror("pthread_create");
+            exit(EXIT_FAILURE);
+        }
     }
     for (int i = 0; i < max_threads; i++) pthread_join(threads[i], NULL);
 
     for (int i = 0; i < max_threads; i++) free(ctx.thread_queues[i].buf);
     free(ctx.thread_queues);
     free(threads);
+    free(wargs);
     free(ctx.dep_remaining);
     free_dependents(&ctx);
+    free(pctx);
 }
 
 // Dependency Analysis
@@ -704,7 +747,7 @@ static void cleanup() {
             HashNode* node = var_table[i];
             while (node) {
                 HashNode* next = node->next;
-                node = next; // Arena-based
+                node = next; // Arena-based nodes not freed individually
             }
         }
         free(var_table);
