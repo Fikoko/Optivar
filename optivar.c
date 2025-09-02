@@ -1,5 +1,5 @@
 // optivar.c -- superoptimized, memory-safe, minimal, scalable IR executor
-// Build: gcc -O3 -march=native -pthread -lz -o optivar optivar.c
+// Build: gcc -O3 -march=native -lz -o optivar optivar.c
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -12,10 +12,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <pthread.h>
 #include <errno.h>
-#include <stdatomic.h>
-#include <sched.h>
 #include <fcntl.h>
 #include <sys/sysinfo.h>
 #include <zlib.h>
@@ -30,18 +27,14 @@
 #define MAX_NAME_LEN 128
 #define CACHE_LINE 64
 #define MAX_ARGS 16
-#define MAX_THREADS_DEFAULT 8
 #define MIN_BIN_SIZE 16
 #define BIN_MAGIC 0xDEADBEEF
-#define WORKQ_MIN_CAP 128
 
 //
 // Config (modifiable by argv)
 //
 static int FIXED_VARS = DEFAULT_FIXED_VARS;
 static int var_table_size = 4096;
-static int single_threaded = 0;
-static int try_pin = 0;
 
 //
 // Basic types
@@ -62,10 +55,8 @@ typedef struct IRStmt {
     int* arg_indices;      // indices into env_array
     int dead;
     int inlined;           // 1 if inlined simple op
-    int dep_count;
-    int* dep_indices;
     int executed;
-    char pad[CACHE_LINE - 9*sizeof(int) - sizeof(void*) - sizeof(int*)];
+    char pad[CACHE_LINE - 7*sizeof(int) - sizeof(void*) - sizeof(int*)];
 } IRStmt;
 
 typedef struct IR {
@@ -230,16 +221,13 @@ static inline unsigned int hash_name(const char* s, int table_size) {
 //
 // Dynamic func table grow
 //
-static pthread_mutex_t func_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void grow_func_table() {
-    pthread_mutex_lock(&func_table_mutex);
     int new_size = func_table_size * 2;
     FuncEntry* nt = realloc(func_table, sizeof(FuncEntry) * new_size);
     if (!nt) { perror("realloc func_table"); exit(EXIT_FAILURE); }
     memset(nt + func_table_size, 0, sizeof(FuncEntry) * (new_size - func_table_size));
     func_table = nt;
     func_table_size = new_size;
-    pthread_mutex_unlock(&func_table_mutex);
 }
 
 //
@@ -304,13 +292,12 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
 // Preload functions in directory (names only); actual mapping deferred until get_func_ptr
 //
 static void preload_binfuncs(const char* dirpath) {
-    pthread_mutex_lock(&func_table_mutex);
     if (!func_table) {
         func_table = calloc(func_table_size, sizeof(FuncEntry));
         if (!func_table) { perror("calloc func_table"); exit(EXIT_FAILURE); }
     }
     DIR* d = opendir(dirpath);
-    if (!d) { fprintf(stderr, "Warning: cannot open %s\n", dirpath); pthread_mutex_unlock(&func_table_mutex); return; }
+    if (!d) { fprintf(stderr, "Warning: cannot open %s\n", dirpath); return; }
     struct dirent* e;
     while ((e = readdir(d)) != NULL) {
         if (e->d_type != DT_REG && e->d_type != DT_UNKNOWN) continue;
@@ -328,13 +315,10 @@ static void preload_binfuncs(const char* dirpath) {
         }
     }
     closedir(d);
-    pthread_mutex_unlock(&func_table_mutex);
 }
 
 static void* get_func_ptr(const char* name, int* arg_count_out, size_t* len_out) {
-    pthread_mutex_lock(&func_table_mutex);
     if (!func_table) {
-        pthread_mutex_unlock(&func_table_mutex);
         *arg_count_out = -1; *len_out = 0;
         return NULL;
     }
@@ -343,7 +327,6 @@ static void* get_func_ptr(const char* name, int* arg_count_out, size_t* len_out)
             if (!func_table[i].ptr) {
                 func_table[i].ptr = load_binfunc(name, &func_table[i].arg_count, &func_table[i].len);
                 if (!func_table[i].ptr) {
-                    pthread_mutex_unlock(&func_table_mutex);
                     *arg_count_out = -1; *len_out = 0;
                     return NULL;
                 }
@@ -351,11 +334,9 @@ static void* get_func_ptr(const char* name, int* arg_count_out, size_t* len_out)
             *arg_count_out = func_table[i].arg_count;
             *len_out = func_table[i].len;
             void* p = func_table[i].ptr;
-            pthread_mutex_unlock(&func_table_mutex);
             return p;
         }
     }
-    pthread_mutex_unlock(&func_table_mutex);
     *arg_count_out = -1; *len_out = 0;
     return NULL;
 }
@@ -415,10 +396,7 @@ static void free_arg_blocks() {
 //
 // var table grow (rebuild)
 //
-static pthread_mutex_t var_table_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static void grow_var_table() {
-    pthread_mutex_lock(&var_table_mutex);
     int new_size = var_table_size * 2;
     HashNode** nt = calloc(new_size, sizeof(HashNode*));
     if (!nt) { perror("calloc var_table"); exit(EXIT_FAILURE); }
@@ -435,11 +413,9 @@ static void grow_var_table() {
     free(var_table);
     var_table = nt;
     var_table_size = new_size;
-    pthread_mutex_unlock(&var_table_mutex);
 }
 
 static int var_index(const char* name) {
-    pthread_mutex_lock(&var_table_mutex);
     if (!var_table) {
         var_table = calloc(var_table_size, sizeof(HashNode*));
         if (!var_table) { perror("calloc var_table"); exit(EXIT_FAILURE); }
@@ -451,7 +427,6 @@ static int var_index(const char* name) {
             // find index in env_array
             for (int j = 0; j < var_count; ++j) {
                 if (env_array[j] == node->slot) {
-                    pthread_mutex_unlock(&var_table_mutex);
                     return j;
                 }
             }
@@ -476,7 +451,6 @@ static int var_index(const char* name) {
     }
     env_array[var_count] = s;
     int idx = var_count++;
-    pthread_mutex_unlock(&var_table_mutex);
     return idx;
 }
 
@@ -494,160 +468,27 @@ static void init_env(int total_vars) {
 }
 
 //
-// Work queue: power-of-two capacity single-writer multiple-reader for push/steal.
-// We'll implement per-thread circular ring with atomic head/tail.
-//
-typedef struct WorkQueue {
-    int *buf;
-    int mask;               // capacity - 1 (power of two)
-    atomic_size_t head;     // index for pop from head (steal)
-    atomic_size_t tail;     // index for push/pop at tail (local thread)
-} WorkQueue;
-
-static WorkQueue* workq_alloc(int cap) {
-    // round up to power of two
-    int c = WORKQ_MIN_CAP;
-    while (c < cap) c <<= 1;
-    WorkQueue* q = malloc(sizeof(WorkQueue));
-    q->buf = aligned_alloc(CACHE_LINE, sizeof(int) * c);
-    if (!q->buf) { perror("aligned_alloc queue"); exit(EXIT_FAILURE); }
-    q->mask = c - 1;
-    atomic_init(&q->head, 0);
-    atomic_init(&q->tail, 0);
-    return q;
-}
-
-static void workq_free(WorkQueue* q) {
-    if (!q) return;
-    if (q->buf) free(q->buf);
-    free(q);
-}
-
-// push by owning thread (lock-free)
-static void workq_push(WorkQueue* q, int v) {
-    size_t t = atomic_fetch_add_explicit(&q->tail, 1, memory_order_relaxed);
-    q->buf[t & q->mask] = v;
-}
-
-// pop from tail by owner thread (fast)
-static int workq_pop_local(WorkQueue* q, int* out) {
-    size_t t = atomic_load_explicit(&q->tail, memory_order_relaxed);
-    if (t == 0) return 0;
-    t = t - 1;
-    if (!atomic_compare_exchange_strong(&q->tail, &((size_t){t+1}), t)) return 0;
-    size_t h = atomic_load_explicit(&q->head, memory_order_acquire);
-    if (h > t) { // empty
-        atomic_store_explicit(&q->tail, t+1, memory_order_release);
-        return 0;
-    }
-    *out = q->buf[t & q->mask];
-    return 1;
-}
-
-// steal from head
-static int workq_steal(WorkQueue* q, int* out) {
-    size_t h = atomic_load_explicit(&q->head, memory_order_acquire);
-    size_t t = atomic_load_explicit(&q->tail, memory_order_acquire);
-    if (h >= t) return 0;
-    if (atomic_compare_exchange_strong(&q->head, &h, h + 1)) {
-        *out = q->buf[h & q->mask];
-        return 1;
-    }
-    return 0;
-}
-
-//
 // Execution context and dependent graph
 //
-typedef struct Dependents {
-    int* list;
-    int capacity;
-    int count;
-} Dependents;
 
-typedef struct ExecContext {
-    IRStmt* stmts;
-    int stmt_count;
-    VarSlot** env;
-    int max_threads;
-    atomic_int* dep_remaining;   // length stmt_count
-    Dependents* dependents;      // length stmt_count
-    atomic_int remaining;
-    WorkQueue** queues;          // per-thread
-} ExecContext;
-
-//
-// build dependents lists (reverse edges)
-//
-static void build_dependents(ExecContext* ctx) {
-    int n = ctx->stmt_count;
-    ctx->dependents = calloc(n, sizeof(Dependents));
-    if (!ctx->dependents) { perror("calloc deps"); exit(EXIT_FAILURE); }
-    for (int i = 0; i < n; ++i) {
-        ctx->dependents[i].capacity = 4;
-        ctx->dependents[i].list = malloc(sizeof(int) * ctx->dependents[i].capacity);
-        ctx->dependents[i].count = 0;
-    }
-    for (int i = 0; i < n; ++i) {
-        IRStmt* s = &ctx->stmts[i];
-        for (int p = 0; p < s->dep_count; ++p) {
-            int pred = s->dep_indices[p];
-            if (pred >= 0 && pred < n) {
-                Dependents* d = &ctx->dependents[pred];
-                if (d->count >= d->capacity) {
-                    d->capacity *= 2;
-                    d->list = realloc(d->list, sizeof(int) * d->capacity);
-                    if (!d->list) { perror("realloc deps"); exit(EXIT_FAILURE); }
-                }
-                d->list[d->count++] = i;
-            }
-        }
-    }
-}
-
-static void free_dependents(ExecContext* ctx) {
-    if (!ctx->dependents) return;
-    for (int i = 0; i < ctx->stmt_count; ++i) if (ctx->dependents[i].list) free(ctx->dependents[i].list);
-    free(ctx->dependents);
-    ctx->dependents = NULL;
-}
-
-//
-// worker thread
-//
-typedef struct WorkerArg {
-    ExecContext* ctx;
-    int tid;
-} WorkerArg;
-
-static void maybe_pin_thread(int tid) {
-    if (!try_pin) return;
-    cpu_set_t cp;
-    CPU_ZERO(&cp);
-    int nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nproc <= 0) return;
-    CPU_SET(tid % nproc, &cp);
-    pthread_setaffinity_np(pthread_self(), sizeof(cp), &cp);
-}
-
-static void execute_single(IRStmt* s, ExecContext* ctx, long* args_buffer) {
+static void execute_single(IRStmt* s, VarSlot** env, long* args_buffer) {
     if (!s || s->dead || s->executed) return;
     // gather args
     for (int i = 0; i < s->argc; ++i) {
         int ai = s->arg_indices[i];
         if (ai < 0 || ai >= var_count) { args_buffer[i] = 0; continue; }
-        VarSlot* a = ctx->env[ai];
+        VarSlot* a = env[ai];
         if (!a) { args_buffer[i] = 0; continue; }
         args_buffer[i] = a->constant ? a->value : (long)a->data;
     }
-    VarSlot* lhs = ctx->env[s->lhs_index];
+    VarSlot* lhs = env[s->lhs_index];
     if (!lhs) return;
     if (s->inlined) {
         long acc = 0;
         int all_const = 1;
         for (int i = 0; i < s->argc; ++i) {
             int ai = s->arg_indices[i];
-            VarSlot* a = ctx->env[ai];
+            VarSlot* a = env[ai];
             if (!a || !a->constant) all_const = 0;
             acc += args_buffer[i];
         }
@@ -665,138 +506,14 @@ static void execute_single(IRStmt* s, ExecContext* ctx, long* args_buffer) {
     s->executed = 1;
 }
 
-static void* worker_main(void* arg) {
-    WorkerArg w = *(WorkerArg*)arg;
-    ExecContext* ctx = w.ctx;
-    int tid = w.tid;
-    // set thread-local arena to a new empty arena (already thread-local)
-    // but ensure we don't free other threads' arenas
-    maybe_pin_thread(tid);
-    long args_buffer[MAX_ARGS];
-    int idx;
-    WorkQueue** qs = ctx->queues;
-    WorkQueue* myq = qs[tid];
-    while (atomic_load_explicit(&ctx->remaining, memory_order_acquire) > 0) {
-        // pop local
-        if (workq_pop_local(myq, &idx)) {
-            execute_single(&ctx->stmts[idx], ctx, args_buffer);
-            atomic_fetch_sub(&ctx->remaining, 1);
-            // notify dependents
-            Dependents* deps = &ctx->dependents[idx];
-            for (int di = 0; di < deps->count; ++di) {
-                int d = deps->list[di];
-                int prev = atomic_fetch_sub(&ctx->dep_remaining[d], 1);
-                if (prev == 1) {
-                    // push to this thread queue (round-robin could be used)
-                    workq_push(qs[tid], d);
-                }
-            }
-            continue;
-        }
-        // try stealing
-        bool stole = false;
-        int n = ctx->max_threads;
-        for (int i = 0; i < n; ++i) {
-            int victim = (tid + 1 + i) % n;
-            if (victim == tid) continue;
-            if (workq_steal(qs[victim], &idx)) {
-                execute_single(&ctx->stmts[idx], ctx, args_buffer);
-                atomic_fetch_sub(&ctx->remaining, 1);
-                Dependents* deps = &ctx->dependents[idx];
-                for (int di = 0; di < deps->count; ++di) {
-                    int d = deps->list[di];
-                    int prev = atomic_fetch_sub(&ctx->dep_remaining[d], 1);
-                    if (prev == 1) {
-                        workq_push(qs[tid], d);
-                    }
-                }
-                stole = true;
-                break;
-            }
-        }
-        if (stole) continue;
-        // nothing to do
-        sched_yield();
-    }
-    // reset thread arena to free thread-local memory
-    thread_arena_reset();
-    return NULL;
-}
-
 //
 // executor entry
 //
 static void executor(IRStmt* stmts, int stmt_count, VarSlot** env, int max_threads) {
-    if (single_threaded) max_threads = 1;
-    ExecContext ctx = {0};
-    ctx.stmts = stmts;
-    ctx.stmt_count = stmt_count;
-    ctx.env = env;
-    ctx.max_threads = max_threads;
-    ctx.dep_remaining = calloc(stmt_count, sizeof(atomic_int));
-    if (!ctx.dep_remaining) { perror("calloc dep_remaining"); exit(EXIT_FAILURE); }
+    (void)max_threads;
+    long args_buffer[MAX_ARGS];
     for (int i = 0; i < stmt_count; ++i) {
-        atomic_init(&ctx.dep_remaining[i], stmts[i].dep_count);
-    }
-    build_dependents(&ctx);
-    ctx.queues = calloc(max_threads, sizeof(WorkQueue*));
-    if (!ctx.queues) { perror("calloc queues"); exit(EXIT_FAILURE); }
-    // create queues sized to stmt_count/max_threads + slack
-    for (int i = 0; i < max_threads; ++i) {
-        int cap = (stmt_count / max_threads) + 256;
-        ctx.queues[i] = workq_alloc(cap);
-    }
-    atomic_init(&ctx.remaining, stmt_count);
-    // seed initial ready stmts across queues (round-robin)
-    int rr = 0;
-    for (int i = 0; i < stmt_count; ++i) {
-        if (stmts[i].dep_count == 0) {
-            workq_push(ctx.queues[rr++ % max_threads], i);
-        }
-    }
-    // spawn threads
-    pthread_t* threads = malloc(sizeof(pthread_t) * max_threads);
-    WorkerArg* wargs = malloc(sizeof(WorkerArg) * max_threads);
-    for (int i = 0; i < max_threads; ++i) {
-        wargs[i].ctx = &ctx;
-        wargs[i].tid = i;
-        if (pthread_create(&threads[i], NULL, worker_main, &wargs[i]) != 0) {
-            perror("pthread_create");
-            exit(EXIT_FAILURE);
-        }
-    }
-    for (int i = 0; i < max_threads; ++i) pthread_join(threads[i], NULL);
-    // cleanup
-    for (int i = 0; i < max_threads; ++i) workq_free(ctx.queues[i]);
-    free(ctx.queues);
-    free(threads);
-    free(wargs);
-    free(ctx.dep_remaining);
-    free_dependents(&ctx);
-}
-
-//
-// compute_dependencies for IR (simple dataflow analysis)
-//
-static void compute_dependencies(IR* ir) {
-    for (int i = 0; i < ir->count; ++i) {
-        IRStmt* s = &ir->stmts[i];
-        int dep_indices[MAX_ARGS];
-        int dcount = 0;
-        for (int a = 0; a < s->argc; ++a) {
-            int arg_idx = s->arg_indices[a];
-            // find any earlier stmt that writes to arg_idx
-            for (int k = 0; k < i; ++k) {
-                if (ir->stmts[k].lhs_index == arg_idx && !ir->stmts[k].dead) {
-                    if (dcount < MAX_ARGS) dep_indices[dcount++] = k;
-                }
-            }
-        }
-        s->dep_count = dcount;
-        if (dcount > 0) {
-            s->dep_indices = arg_alloc(dcount);
-            memcpy(s->dep_indices, dep_indices, sizeof(int) * dcount);
-        }
+        execute_single(&stmts[i], env, args_buffer);
     }
 }
 
@@ -911,8 +628,6 @@ static IRStmt* parse_line(const char* line, IR* ir) {
     s->func_ptr = get_func_ptr(fname, &s->arg_count, &flen);
     // if func_ptr == NULL -> we'll leave it NULL (error will be reported at execution)
     s->inlined = 0;
-    s->dep_count = 0;
-    s->dep_indices = NULL;
     s->dead = 0;
     s->executed = 0;
     return s;
@@ -930,7 +645,6 @@ static IR* parse_script_file(const char* path) {
     }
     free(line);
     fclose(f);
-    compute_dependencies(ir);
     return ir;
 }
 
@@ -940,23 +654,20 @@ static IR* parse_script_file(const char* path) {
 static void parse_args(int argc, char** argv, char** script_path, int* max_threads) {
     *script_path = NULL;
     *max_threads = sysconf(_SC_NPROCESSORS_ONLN);
-    if (*max_threads <= 0) *max_threads = MAX_THREADS_DEFAULT;
+    if (*max_threads <= 0) *max_threads = 8;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--single-thread") == 0) single_threaded = 1;
-        else if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
+        if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
             FIXED_VARS = atoi(argv[i] + 13);
             if (FIXED_VARS <= 0) FIXED_VARS = DEFAULT_FIXED_VARS;
         } else if (strncmp(argv[i], "--table-size=", 13) == 0) {
             var_table_size = atoi(argv[i] + 13);
             if (var_table_size <= 0) var_table_size = 4096;
-        } else if (strcmp(argv[i], "--pin") == 0) {
-            try_pin = 1;
         } else if (argv[i][0] != '-') {
             *script_path = argv[i];
         }
     }
     if (!*script_path) {
-        fprintf(stderr, "Usage: %s <script.optivar> [--single-thread] [--fixed-vars=N] [--table-size=N] [--pin]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 }
