@@ -483,18 +483,7 @@ static void execute_single(IRStmt* s, VarSlot** env, long* args_buffer) {
     }
     VarSlot* lhs = env[s->lhs_index];
     if (!lhs) return;
-    if (s->inlined) {
-        long acc = 0;
-        int all_const = 1;
-        for (int i = 0; i < s->argc; ++i) {
-            int ai = s->arg_indices[i];
-            VarSlot* a = env[ai];
-            if (!a || !a->constant) all_const = 0;
-            acc += args_buffer[i];
-        }
-        lhs->value = acc;
-        lhs->constant = all_const;
-    } else if (s->func_ptr) {
+      else if (s->func_ptr) {
         // expected signature: void fn(long* out, long* args)
         void (*fn)(long*, long*) = s->func_ptr;
         fn(&lhs->value, args_buffer);
