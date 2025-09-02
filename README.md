@@ -12,8 +12,7 @@
 This design allows:
 
 - Extremely **lightweight and fast execution**  
-- **Dynamic scheduling** of dependent tasks  
-- **Scalable orchestration** across multiple threads or nodes  
+- **Scalable orchestration** via plugin like superoptimized .bin files  
 
 Researchers can implement **low-level operations** (like arithmetic, control structures, loops, etc.) using a **minimalist Turing-complete instruction set**, while practitioners only need to define **inputs and outputs** as variables and orchestrate computations.
 
@@ -23,7 +22,6 @@ Researchers can implement **low-level operations** (like arithmetic, control str
 
 - **Minimal core, maximum flexibility:** Only essential syntax is built-in; all heavy operations are optional binaries.  
 - **Hardware-aware optimization:** Binaries are compiled for specific architectures for maximum performance.  
-- **Dynamic orchestration:** Runtime dependency management and scheduling are handled automatically.  
 - **Clear separation of roles:** Researchers build optimized functions; practitioners orchestrate workflows.  
 - **Extensible and modular:** Users can fetch new binaries from a marketplace depending on their computation needs.
 
