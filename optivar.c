@@ -35,6 +35,7 @@
 //
 static int FIXED_VARS = DEFAULT_FIXED_VARS;
 static int var_table_size = 4096;
+static int strict_mode = 0;  // 0 = skip missing functions, 1 = stop
 
 //
 // Basic types
@@ -117,40 +118,52 @@ typedef struct {
 } BinHeader;
 
 //
-// Thread-local arena allocator: per-thread fast bump allocator.
+// Single sequential arena
 //
-static __thread char* arena_ptr = NULL;
-static __thread size_t arena_size = 0;
+#define ARENA_DEFAULT_SIZE (16 * 1024 * 1024)  // 16 MB default
 
-static void* thread_arena_alloc(size_t size) {
-    // align to 16
-    size_t a = (size + 15) & ~((size_t)15);
-    if (!arena_ptr || arena_size < a) {
-        size_t new_size = a > 65536 ? a : 65536;
-        // posix_memalign to respect alignment
-        void* mem = NULL;
-        if (posix_memalign(&mem, CACHE_LINE, new_size) != 0 || !mem) {
-            perror("posix_memalign (arena)");
-            exit(EXIT_FAILURE);
-        }
-        // free old arena if exists
-        if (arena_ptr) free(arena_ptr);
-        arena_ptr = mem;
+static char* arena_ptr = NULL;    // start of buffer
+static size_t arena_size = 0;     // total allocated
+static size_t arena_used = 0;     // current offset
+
+// ----------------------
+// Arena helpers
+// ----------------------
+#define ARENA_ALIGN 64
+static void* arena_alloc(size_t size) {
+    size = (size + ARENA_ALIGN - 1) & ~(ARENA_ALIGN - 1); // align
+    if (!arena_ptr) {
+        arena_size = (size > ARENA_DEFAULT_SIZE) ? size : ARENA_DEFAULT_SIZE;
+        arena_ptr = malloc(arena_size);
+        if (!arena_ptr) { perror("malloc arena"); exit(EXIT_FAILURE); }
+        arena_used = 0;
+    }
+    if (arena_used + size > arena_size) {
+        size_t new_size = arena_size * 2;
+        while (arena_used + size > new_size) new_size *= 2;
+        char* new_ptr = realloc(arena_ptr, new_size);
+        if (!new_ptr) { perror("realloc arena"); exit(EXIT_FAILURE); }
+        arena_ptr = new_ptr;
         arena_size = new_size;
     }
-    void* out = arena_ptr;
-    arena_ptr += a;
-    arena_size -= a;
+    void* out = arena_ptr + arena_used;
+    arena_used += size;
     return out;
 }
 
-static void thread_arena_reset() {
-    if (arena_ptr) {
-        free(arena_ptr);
-        arena_ptr = NULL;
-        arena_size = 0;
-    }
+// reset arena (does not free buffer, just resets usage)
+static void arena_reset() {
+    arena_used = 0;
 }
+
+// free arena completely
+static void arena_free() {
+    if (arena_ptr) free(arena_ptr);
+    arena_ptr = NULL;
+    arena_size = 0;
+    arena_used = 0;
+}
+
 
 //
 // Pool allocator for VarSlot
@@ -193,7 +206,7 @@ static VarSlot* pool_alloc() {
     }
     // create new chunk from thread arena (fast)
     int cap = VAR_CHUNK_SIZE;
-    VarPoolChunk* nc = thread_arena_alloc(sizeof(VarPoolChunk));
+    VarPoolChunk* nc = arena_alloc(sizeof(VarPoolChunk));
     nc->slots = aligned_alloc(CACHE_LINE, cap * sizeof(VarSlot));
     if (!nc->slots) { perror("aligned_alloc slots"); exit(EXIT_FAILURE); }
     nc->capacity = cap;
@@ -231,60 +244,34 @@ static void grow_func_table() {
 }
 
 //
-// load .bin function with CRC32 & mmap; returns executable pointer
+// Optimized .bin loading
 //
 static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out) {
     char path[512];
     snprintf(path, sizeof(path), "./funcs/%s.bin", name);
     struct stat st;
-    if (stat(path, &st) != 0) {
-        fprintf(stderr, "Error: %s not found\n", path);
-        return NULL;
-    }
-    if (st.st_size < (ssize_t)(sizeof(BinHeader) + MIN_BIN_SIZE)) {
-        fprintf(stderr, "Error: %s too small\n", path);
-        return NULL;
-    }
+    if (stat(path, &st) != 0) { fprintf(stderr, "Error: %s not found\n", path); return NULL; }
+
+    if (st.st_size < sizeof(BinHeader) + MIN_BIN_SIZE) { fprintf(stderr, "Error: %s too small\n", path); return NULL; }
+
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open bin"); return NULL; }
+
     BinHeader hdr;
-    if (read(fd, &hdr, sizeof(BinHeader)) != (ssize_t)sizeof(BinHeader)) {
-        fprintf(stderr, "Error: read header %s\n", path);
-        close(fd);
-        return NULL;
-    }
-    if (hdr.magic != BIN_MAGIC) {
-        fprintf(stderr, "Error: bad magic in %s\n", path);
-        close(fd); return NULL;
-    }
-    if (hdr.arg_count < 0) {
-        fprintf(stderr, "Error: bad arg_count in %s\n", path);
-        close(fd); return NULL;
-    }
-    uint32_t expected_code_size = hdr.code_size;
-    uint32_t actual_code_size = st.st_size - sizeof(BinHeader);
-    if (expected_code_size != actual_code_size) {
-        fprintf(stderr, "Error: code_size mismatch in %s\n", path);
-        close(fd); return NULL;
-    }
-    if (lseek(fd, sizeof(BinHeader), SEEK_SET) < 0) { perror("lseek"); close(fd); return NULL; }
-    char* buf = malloc(actual_code_size);
-    if (!buf) { perror("malloc code"); close(fd); return NULL; }
-    if (read(fd, buf, actual_code_size) != (ssize_t)actual_code_size) {
-        fprintf(stderr, "Error: read code %s\n", path); free(buf); close(fd); return NULL;
-    }
-    uint32_t crc = crc32(0, (unsigned char*)buf, actual_code_size);
-    if (crc != hdr.code_crc) {
-        fprintf(stderr, "Error: CRC mismatch in %s (got 0x%x need 0x%x)\n", path, crc, hdr.code_crc);
-        free(buf); close(fd); return NULL;
-    }
-    // Map code executable: map file region starting at offset sizeof(BinHeader)
-    void* mapped = mmap(NULL, actual_code_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, sizeof(BinHeader));
-    if (mapped == MAP_FAILED) { perror("mmap"); free(buf); close(fd); return NULL; }
-    free(buf);
+    if (read(fd, &hdr, sizeof(BinHeader)) != (ssize_t)sizeof(BinHeader)) { perror("read header"); close(fd); return NULL; }
+    if (hdr.magic != BIN_MAGIC) { fprintf(stderr, "Error: bad magic in %s\n", path); close(fd); return NULL; }
+
+    size_t code_size = st.st_size - sizeof(BinHeader);
+    void* mapped = mmap(NULL, code_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, sizeof(BinHeader));
+    if (mapped == MAP_FAILED) { perror("mmap"); close(fd); return NULL; }
+
+    // CRC check in-place
+    uint32_t crc = crc32(0, (unsigned char*)mapped, code_size);
+    if (crc != hdr.code_crc) { fprintf(stderr, "CRC mismatch %s\n", path); munmap(mapped, code_size); close(fd); return NULL; }
+
     close(fd);
     *arg_count_out = hdr.arg_count;
-    *len_out = actual_code_size;
+    *len_out = code_size;
     return mapped;
 }
 
@@ -367,30 +354,30 @@ typedef struct ArgBlock {
     int used;
     struct ArgBlock* next;
 } ArgBlock;
+
 static ArgBlock* arg_blocks = NULL;
 
 static int* arg_alloc(int n) {
-    ArgBlock* b = arg_blocks;
-    while (b) {
-        if (b->capacity - b->used >= n) {
-            int* out = b->args + b->used;
-            b->used += n;
-            return out;
-        }
-        b = b->next;
+    // check if current block has enough space
+    if (!arg_blocks || arg_blocks->capacity - arg_blocks->used < n) {
+        int cap = (n > FIXED_ARG_POOL) ? n : FIXED_ARG_POOL;
+        ArgBlock* nb = arena_alloc(sizeof(ArgBlock));
+        nb->args = arena_alloc(sizeof(int) * cap);
+        nb->capacity = cap;
+        nb->used = 0;
+        nb->next = arg_blocks;
+        arg_blocks = nb;
     }
-    int cap = (n > FIXED_ARG_POOL) ? n : FIXED_ARG_POOL;
-    ArgBlock* nb = thread_arena_alloc(sizeof(ArgBlock));
-    nb->args = thread_arena_alloc(sizeof(int) * cap);
-    nb->capacity = cap;
-    nb->used = n;
-    nb->next = arg_blocks;
-    arg_blocks = nb;
-    return nb->args;
+
+    // allocate from current block
+    int* out = arg_blocks->args + arg_blocks->used;
+    arg_blocks->used += n;
+    return out;
 }
 
+// reset function (optional)
 static void free_arg_blocks() {
-    arg_blocks = NULL; // arena reset will free memory
+    arg_blocks = NULL; // memory is freed by arena_reset()
 }
 
 //
@@ -437,7 +424,7 @@ static int var_index(const char* name) {
     VarSlot* s = pool_alloc();
     s->data = strdup(name);
     if (!s->data) { perror("strdup"); exit(EXIT_FAILURE); }
-    HashNode* hn = thread_arena_alloc(sizeof(HashNode));
+    HashNode* hn = arena_alloc(sizeof(HashNode));
     hn->slot = s;
     hn->name = s->data;
     hn->next = var_table[h];
@@ -498,51 +485,35 @@ static void execute_single(IRStmt* s, VarSlot** env, long* args_buffer) {
 //
 // executor entry
 //
-static void executor(IRStmt* stmts, int stmt_count, VarSlot** env, int max_threads) {
-    (void)max_threads;
+static void executor(IRStmt* stmts, int stmt_count, VarSlot** env) {
     long args_buffer[MAX_ARGS];
     for (int i = 0; i < stmt_count; ++i) {
         execute_single(&stmts[i], env, args_buffer);
     }
 }
 
-//
-// cleanup resources
-//
+// ----------------------
+// Cleanup (robust)
+// ----------------------
 static void cleanup_all() {
     free_arg_blocks();
     if (env_array) {
-        for (int i = 0; i < var_count; ++i) {
+        for (int i = 0; i < var_count; ++i)
             if (env_array[i] && env_array[i]->data) free(env_array[i]->data);
-        }
-        free(env_array);
-        env_array = NULL;
+        free(env_array); env_array = NULL;
     }
-    if (var_table) {
-        free(var_table);
-        var_table = NULL;
-    }
-    if (fixed_pool) {
-        free(fixed_pool);
-        fixed_pool = NULL;
-    }
+    if (var_table) { free(var_table); var_table = NULL; }
+    if (fixed_pool) { free(fixed_pool); fixed_pool = NULL; }
     VarPoolChunk* c = dynamic_pool;
-    while (c) {
-        VarPoolChunk* nx = c->next;
-        if (c->slots) free(c->slots);
-        c = nx;
-    }
+    while (c) { VarPoolChunk* nx = c->next; if (c->slots) free(c->slots); c = nx; }
     dynamic_pool = NULL;
     if (func_table) {
-        for (int i = 0; i < func_count; ++i) {
-            if (func_table[i].ptr && func_table[i].len > 0) {
+        for (int i = 0; i < func_count; ++i)
+            if (func_table[i].ptr && func_table[i].len > 0)
                 munmap(func_table[i].ptr, func_table[i].len);
-            }
-        }
-        free(func_table);
-        func_table = NULL;
+        free(func_table); func_table = NULL;
     }
-    thread_arena_reset();
+    arena_reset();
 }
 
 static void atexit_cleanup() { cleanup_all(); }
@@ -615,13 +586,20 @@ static IRStmt* parse_line(const char* line, IR* ir) {
     memcpy(s->arg_indices, arg_indices, sizeof(int) * arg_count);
     size_t flen = 0;
     s->func_ptr = get_func_ptr(fname, &s->arg_count, &flen);
-    // if func_ptr == NULL -> we'll leave it NULL (error will be reported at execution)
+    if (!s->func_ptr) {
+        if (strict_mode) {
+            fprintf(stderr, "Error: function '%s' not found. Execution stopped due to strict mode.\n", fname);
+            exit(EXIT_FAILURE);
+        } else {
+            fprintf(stderr, "Warning: function '%s' not found. Execution will skip this op.\n", fname);
+            s->dead = 1;
+        }
+    }
     s->inlined = 0;
-    s->dead = 0;
     s->executed = 0;
     return s;
-}
-
+    }
+    
 static IR* parse_script_file(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) { perror("fopen script"); return NULL; }
@@ -661,6 +639,20 @@ static void parse_args(int argc, char** argv, char** script_path, int* max_threa
     }
 }
 
+static void run_script(const char* path) {
+    IR* ir = parse_script_file(path);
+    if (!ir) {
+        fprintf(stderr, "Error: failed to parse script %s\n", path);
+        return;
+    }
+
+    executor(ir->stmts, ir->count, env_array);
+
+    // Cleanup IR memory
+    if (ir->stmts) free(ir->stmts);
+    free(ir);
+}
+
 //
 // main
 //
@@ -694,6 +686,8 @@ int main(int argc, char **argv) {
             preload_all = 1;
         } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
             preload_list = argv[i] + 15; // skip "list:"
+        } else if (strcmp(argv[i], "--strict") == 0) {
+            strict_mode = 1;
         } else if (argv[i][0] != '-') {
             script_path = argv[i];
         }
