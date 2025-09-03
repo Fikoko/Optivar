@@ -664,29 +664,61 @@ static void parse_args(int argc, char** argv, char** script_path, int* max_threa
 //
 // main
 //
-int main(int argc, char** argv) {
-    atexit(atexit_cleanup);
-    char* script_path = NULL;
-    int max_threads = 0;
-    parse_args(argc, argv, &script_path, &max_threads);
-    // init
-    preload_binfuncs("./funcs");
-    IR* ir = parse_script_file(script_path);
-    if (!ir) { cleanup_all(); return 1; }
-    // initialize environment with discovered var_count
-    init_env(var_count);
-    // execute
-    executor(ir->stmts, ir->count, env_array, max_threads);
-    // print results
-    for (int i = 0; i < var_count; ++i) {
-        VarSlot* v = env_array[i];
-        const char* name = (v && v->data) ? (char*)v->data : "<anon>";
-        long val = v ? v->value : 0;
-        printf("%s = %ld\n", name, val);
+int preload_all = 0;
+char *preload_list = NULL;
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <script.optivar> [--preload|--preload=list:bin1,bin2,...]\n", argv[0]);
+        return 1;
     }
-    // free IR
-    if (ir->stmts) free(ir->stmts);
-    free(ir);
-    cleanup_all();
+
+    // Parse command line flags
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--preload") == 0) {
+            preload_all = 1;
+        } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
+            preload_list = argv[i] + 15; // skip "list:"
+        }
+    }
+
+    // Load function table (names only)
+    preload_binfuncs("./funcs");
+
+    // If preload is requested
+    if (preload_all) {
+        // Preload all bins
+        for (int i = 0; i < func_count; i++) {
+            if (!func_table[i].ptr) {
+                func_table[i].ptr = load_binfunc(
+                    func_table[i].name,
+                    &func_table[i].arg_count,
+                    &func_table[i].len
+                );
+            }
+        }
+    } else if (preload_list) {
+        // Preload only selected bins
+        char *list_copy = strdup(preload_list);
+        char *token = strtok(list_copy, ",");
+        while (token) {
+            for (int i = 0; i < func_count; i++) {
+                if (strcmp(func_table[i].name, token) == 0 && !func_table[i].ptr) {
+                    func_table[i].ptr = load_binfunc(
+                        func_table[i].name,
+                        &func_table[i].arg_count,
+                        &func_table[i].len
+                    );
+                }
+            }
+            token = strtok(NULL, ",");
+        }
+        free(list_copy);
+    }
+
+    // Run the script
+    run_script(argv[1]);
+
     return 0;
 }
+
