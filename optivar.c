@@ -668,26 +668,50 @@ int preload_all = 0;
 char *preload_list = NULL;
 
 int main(int argc, char **argv) {
+    // Ensure resources are cleaned up on exit
+    atexit(cleanup_all);
+
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <script.optivar> [--preload|--preload=list:bin1,bin2,...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N] [--preload|--preload=list:bin1,bin2,...]\n", argv[0]);
         return 1;
     }
 
-    // Parse command line flags
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--preload") == 0) {
+    // Default config
+    FIXED_VARS = DEFAULT_FIXED_VARS;
+    var_table_size = 4096;
+
+    char *script_path = NULL;
+
+    // Parse command-line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
+            FIXED_VARS = atoi(argv[i] + 13);
+            if (FIXED_VARS <= 0) FIXED_VARS = DEFAULT_FIXED_VARS;
+        } else if (strncmp(argv[i], "--table-size=", 13) == 0) {
+            var_table_size = atoi(argv[i] + 13);
+            if (var_table_size <= 0) var_table_size = 4096;
+        } else if (strcmp(argv[i], "--preload") == 0) {
             preload_all = 1;
         } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
             preload_list = argv[i] + 15; // skip "list:"
+        } else if (argv[i][0] != '-') {
+            script_path = argv[i];
         }
     }
+
+    if (!script_path) {
+        fprintf(stderr, "Error: no script specified\n");
+        return 1;
+    }
+
+    // Initialize environment
+    init_env(FIXED_VARS * 2);
 
     // Load function table (names only)
     preload_binfuncs("./funcs");
 
-    // If preload is requested
+    // Preload requested bins
     if (preload_all) {
-        // Preload all bins
         for (int i = 0; i < func_count; i++) {
             if (!func_table[i].ptr) {
                 func_table[i].ptr = load_binfunc(
@@ -698,7 +722,6 @@ int main(int argc, char **argv) {
             }
         }
     } else if (preload_list) {
-        // Preload only selected bins
         char *list_copy = strdup(preload_list);
         char *token = strtok(list_copy, ",");
         while (token) {
@@ -717,8 +740,7 @@ int main(int argc, char **argv) {
     }
 
     // Run the script
-    run_script(argv[1]);
+    run_script(script_path);
 
-    return 0;
+    return 0; // cleanup_all() runs automatically here
 }
-
