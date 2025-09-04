@@ -57,6 +57,13 @@ typedef struct IRStmt {
     char pad[CACHE_LINE - 3*sizeof(int) - sizeof(void*) - sizeof(int*)];
 } IRStmt;
 
+typedef struct ArgEntry {
+    VarSlot* lhs;       // pointer to left-hand-side variable
+    void* func_ptr;     // pointer to function (bin)
+    int argc;           // number of arguments
+    VarSlot** args;     // array of pointers to argument VarSlots
+} ArgEntry;
+
 typedef struct IR {
     IRStmt* stmts;
     int count;
@@ -86,6 +93,7 @@ static int env_alloc_size = 0;
 typedef struct HashNode {
     VarSlot* slot;
     char* name;         // points into slot->data (strdup)
+    int index;
     struct HashNode* next;
 } HashNode;
 static HashNode** var_table = NULL;
@@ -368,31 +376,6 @@ static IRStmt* ir_alloc_stmt(IR* ir) {
 }
 
 //
-// Arg block allocator (arena-backed)
-//
-typedef struct ArgBlock {
-    int* args;
-    int capacity;
-    int used;
-    struct ArgBlock* next;
-} ArgBlock;
-
-static ArgBlock* arg_blocks = NULL;
-
-static int* arg_alloc(int n) {
-    if (n <= 0) return NULL;
-    int* arr = arena_alloc(sizeof(int) * n);
-    if (!arr) { perror("arena_alloc arg"); exit(EXIT_FAILURE); }
-    return arr;
-}
-
-
-// reset function (optional)
-static void free_arg_blocks() {
-    arg_blocks = NULL; // memory is freed by arena_reset()
-}
-
-//
 // var table grow (rebuild)
 //
 static void grow_var_table() {
@@ -422,15 +405,11 @@ static int var_index(const char* name) {
     unsigned int h = hash_name(name, var_table_size);
     HashNode* node = var_table[h];
     while (node) {
-        if (strcmp(node->name, name) == 0) {
-            // find index in env_array
-            for (int j = 0; j < var_count; ++j) {
-                if (env_array[j] == node->slot) {
-                    return j;
-                }
-            }
+            if (strcmp(node->name, name) == 0) {
+        return node->index;   // O(1) now
         }
-        node = node->next;
+    node = node->next;
+
     }
     // add new var
     VarSlot* s = pool_alloc();
@@ -448,6 +427,7 @@ static int var_index(const char* name) {
         env_array = ne;
         env_alloc_size = ns;
     }
+    hn->index = var_count;   // store the index directly
     env_array[var_count] = s;
     int idx = var_count++;
     return idx;
@@ -471,96 +451,101 @@ static void init_env(int total_vars) {
     memset(fixed_pool, 0, sizeof(VarSlot) * FIXED_VARS);
 }
 
-//
-// Execution context and dependent graph
-//
+// ir_to_argentries
+static ArgEntry* ir_to_argentries(IRStmt* stmts, int count, VarSlot** env) {
+    if (count <= 0) return NULL;
+    ArgEntry* entries = malloc(sizeof(ArgEntry) * count);
+    if (!entries) { perror("malloc ArgEntry"); exit(EXIT_FAILURE); }
 
-static void execute_single(IRStmt* s, VarSlot** env, long* args_buffer) {
-    if (!s || s->dead) return;
-
-    // allocate arg_types dynamically
-    int* arg_types = NULL;
-    if (s->argc > 0) {
-        arg_types = malloc(sizeof(int) * s->argc);
-        if (!arg_types) {
-            perror("malloc arg_types");
-            return;
+    for (int i = 0; i < count; ++i) {
+        IRStmt* s = &stmts[i];
+        entries[i].lhs = env[s->lhs_index];
+        entries[i].func_ptr = s->func_ptr;
+        entries[i].argc = s->argc;
+        if (s->argc > 0) {
+            entries[i].args = arena_alloc(sizeof(VarSlot*) * s->argc);
+            for (int j = 0; j < s->argc; ++j) entries[i].args[j] = env[s->arg_indices[j]];
+        } else {
+            entries[i].args = NULL;
         }
     }
-
-    for (int i = 0; i < s->argc; ++i) {
-        int ai = s->arg_indices[i];
-        if (ai < 0 || ai >= var_count) {
-            args_buffer[i] = 0;
-            arg_types[i] = 0;
-            continue;
-        }
-
-        VarSlot* a = env[ai];
-        if (!a) { args_buffer[i] = 0; arg_types[i] = 0; continue; }
-
-        void* func_ptr = NULL;
-        size_t flen;
-        int arg_count;
-        if (a->data) {
-            func_ptr = get_func_ptr((char*)a->data, &arg_count, &flen);
-        }
-
-        args_buffer[i] = func_ptr ? (long)func_ptr : a->value;
-        arg_types[i] = func_ptr ? 1 : 0;
-    }
-
-    VarSlot* lhs = env[s->lhs_index];
-    if (!lhs) {
-        free(arg_types);
-        return;
-    }
-
-    if (s->func_ptr) {
-        void (*fn)(long*, long*, int*) = s->func_ptr;
-        fn(&lhs->value, args_buffer, arg_types);
-    }
-
-    free(arg_types);
+    return entries;
 }
+
+static long* args_buffer = NULL;
+static size_t args_buffer_size = 0;
 
 //
 // executor entry
 //
 static void executor(IRStmt* stmts, int stmt_count, VarSlot** env) {
+    if (!stmts || stmt_count <= 0) return;
+
+    ArgEntry* entries = ir_to_argentries(stmts, stmt_count, env);
+    if (!entries) return;
+
     for (int i = 0; i < stmt_count; ++i) {
-        IRStmt* s = &stmts[i];
-        if (!s || s->dead) continue;
+        ArgEntry* e = &entries[i];
+        if (!e->lhs || e->lhs->in_use == 0) continue;  // skip dead vars
 
-        // allocate args buffer dynamically for this statement
-        long* args_buffer = NULL;
-        if (s->argc > 0) {
-            args_buffer = malloc(sizeof(long) * s->argc);
-            if (!args_buffer) {
-                perror("malloc args_buffer");
-                continue;
+        if (e->func_ptr) {
+            // allocate/reuse argument buffer
+            if (e->argc > 0) {
+                if ((size_t)e->argc > args_buffer_size) {
+                    free(args_buffer);
+                    args_buffer = malloc(sizeof(long) * e->argc);
+                    if (!args_buffer) { perror("malloc args_buffer"); exit(EXIT_FAILURE); }
+                    args_buffer_size = e->argc;
+                }
+                for (int j = 0; j < e->argc; ++j) {
+                    args_buffer[j] = e->args[j] ? e->args[j]->value : 0;
+                }
             }
+
+            // call function: signature void fn(long* out, long* args, int* extra)
+            void (*fn)(long*, long*, int*) = e->func_ptr;
+            fn(&e->lhs->value, (e->argc > 0) ? args_buffer : NULL, NULL);
         }
-
-        execute_single(s, env, args_buffer);
-
-        free(args_buffer);
     }
+
+    // free ArgEntry args pointers (allocated from arena)
+    for (int i = 0; i < stmt_count; ++i) {
+        if (entries[i].args) free(entries[i].args);
+    }
+    free(entries);
+
+    // args_buffer will persist and be reused in future calls
+    // free it in cleanup_all() to avoid leaks
 }
 
-
-// ----------------------
-// Cleanup (robust)
-// ----------------------
 static void cleanup_all() {
-    free_arg_blocks();
+    // Free environment variables
     if (env_array) {
         for (int i = 0; i < var_count; ++i)
             if (env_array[i] && env_array[i]->data) free(env_array[i]->data);
-        free(env_array); env_array = NULL;
+        free(env_array);
+        env_array = NULL;
     }
-    if (var_table) { free(var_table); var_table = NULL; }
+
+    // Free variable hash table (nodes only, slots already freed)
+    if (var_table) {
+        for (int i = 0; i < var_table_size; ++i) {
+            HashNode* node = var_table[i];
+            while (node) {
+                HashNode* nx = node->next;
+                // node->slot already freed
+                // node->name points into slot->data, already freed
+                node = nx;
+            }
+        }
+        free(var_table);
+        var_table = NULL;
+    }
+
+    // Free fixed pool
     if (fixed_pool) { free(fixed_pool); fixed_pool = NULL; }
+
+    // Free dynamic pool chunks
     VarPoolChunk* c = dynamic_pool;
     while (c) {
         VarPoolChunk* nx = c->next;
@@ -568,13 +553,25 @@ static void cleanup_all() {
         c = nx;
     }
     dynamic_pool = NULL;
+
+    // Free preloaded .bin functions
     if (func_table) {
         for (int i = 0; i < func_count; ++i)
             if (func_table[i].ptr && func_table[i].len > 0)
                 munmap(func_table[i].ptr, func_table[i].len);
-        free(func_table); func_table = NULL;
+        free(func_table);
+        func_table = NULL;
     }
-    arena_free();  // Changed from arena_reset
+
+    // Free arena memory
+    arena_free();
+
+    // Free static executor args buffer
+    if (args_buffer) {
+        free(args_buffer);
+        args_buffer = NULL;
+        args_buffer_size = 0;
+    }
 }
 
 //
