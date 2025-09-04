@@ -12,11 +12,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <sys/sysinfo.h>
 #include <zlib.h>
-#include <time.h>
+#include <limits.h>
+#include <assert.h>
+static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
+static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 
 //
 // Tunables
@@ -44,9 +45,8 @@ typedef struct VarSlot {
     void* data;     // either pointer payload or strdup'd name
     int in_use;
     int last_use;
-    int constant;   // 1 if value valid in 'value'
-    long value;     // numeric value if constant
-    char pad[CACHE_LINE - sizeof(void*) - 4*sizeof(int) - sizeof(long)];
+    long value;     // numeric value if needed
+    char pad[CACHE_LINE - sizeof(void*) - 2*sizeof(int) - sizeof(long)];
 } VarSlot;
 
 typedef struct IRStmt {
@@ -55,9 +55,7 @@ typedef struct IRStmt {
     int argc;
     int* arg_indices;      // indices into env_array
     int dead;
-    int inlined;           // 1 if inlined simple op
-    int executed;
-    char pad[CACHE_LINE - 7*sizeof(int) - sizeof(void*) - sizeof(int*)];
+    char pad[CACHE_LINE - 3*sizeof(int) - sizeof(void*) - sizeof(int*)];
 } IRStmt;
 
 typedef struct IR {
@@ -109,6 +107,9 @@ static int func_count = 0;
 
 //
 // Bin header
+// Note: .bin functions have signature void fn(long* out, long* args).
+//       args[i] may be a function pointer (if the argument matches a func_table entry)
+//       or a value (VarSlot->value for non-function variables).
 //
 typedef struct {
     uint32_t magic;
@@ -139,8 +140,18 @@ static void* arena_alloc(size_t size) {
         arena_used = 0;
     }
     if (arena_used + size > arena_size) {
+        if (arena_size > SIZE_MAX / 2 || arena_used > SIZE_MAX - size) {
+            fprintf(stderr, "Error: arena size overflow\n");
+            exit(EXIT_FAILURE);
+        }
         size_t new_size = arena_size * 2;
-        while (arena_used + size > new_size) new_size *= 2;
+        while (arena_used + size > new_size) {
+            if (new_size > SIZE_MAX / 2) {
+                fprintf(stderr, "Error: arena size overflow\n");
+                exit(EXIT_FAILURE);
+            }
+            new_size *= 2;
+        }
         char* new_ptr = realloc(arena_ptr, new_size);
         if (!new_ptr) { perror("realloc arena"); exit(EXIT_FAILURE); }
         arena_ptr = new_ptr;
@@ -174,7 +185,6 @@ static VarSlot* pool_alloc() {
         if (!fixed_pool[i].in_use) {
             fixed_pool[i].in_use = 1;
             fixed_pool[i].last_use = -1;
-            fixed_pool[i].constant = 0;
             fixed_pool[i].data = NULL;
             fixed_pool[i].value = 0;
             return &fixed_pool[i];
@@ -184,7 +194,6 @@ static VarSlot* pool_alloc() {
         VarSlot* s = &fixed_pool[fixed_top++];
         s->in_use = 1;
         s->last_use = -1;
-        s->constant = 0;
         s->data = NULL;
         s->value = 0;
         return s;
@@ -196,7 +205,6 @@ static VarSlot* pool_alloc() {
             if (!c->slots[i].in_use) {
                 c->slots[i].in_use = 1;
                 c->slots[i].last_use = -1;
-                c->slots[i].constant = 0;
                 c->slots[i].data = NULL;
                 c->slots[i].value = 0;
                 return &c->slots[i];
@@ -215,7 +223,6 @@ static VarSlot* pool_alloc() {
     memset(nc->slots, 0, cap * sizeof(VarSlot));
     nc->slots[0].in_use = 1;
     nc->slots[0].last_use = -1;
-    nc->slots[0].constant = 0;
     return &nc->slots[0];
 }
 
@@ -264,6 +271,9 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
     size_t code_size = st.st_size - sizeof(BinHeader);
     void* mapped = mmap(NULL, code_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, sizeof(BinHeader));
     if (mapped == MAP_FAILED) { perror("mmap"); close(fd); return NULL; }
+    if (((uintptr_t)mapped % sysconf(_SC_PAGESIZE)) != 0) {
+        fprintf(stderr, "Warning: mmap not page-aligned for %s\n", path);
+    }
 
     // CRC check in-place
     uint32_t crc = crc32(0, (unsigned char*)mapped, code_size);
@@ -445,7 +455,12 @@ static int var_index(const char* name) {
 // initialize env
 //
 static void init_env(int total_vars) {
-    env_alloc_size = total_vars > 0 ? total_vars : (FIXED_VARS * 2);
+    if (total_vars <= 0) total_vars = FIXED_VARS * 2;
+    if (total_vars > (1 << 20)) {  // Limit to ~1M
+        fprintf(stderr, "Error: FIXED_VARS too large\n");
+        exit(EXIT_FAILURE);
+    }
+    env_alloc_size = total_vars;
     env_array = aligned_alloc(CACHE_LINE, sizeof(VarSlot*) * env_alloc_size);
     if (!env_array) { perror("aligned_alloc env"); exit(EXIT_FAILURE); }
     memset(env_array, 0, sizeof(VarSlot*) * env_alloc_size);
@@ -459,27 +474,32 @@ static void init_env(int total_vars) {
 //
 
 static void execute_single(IRStmt* s, VarSlot** env, long* args_buffer) {
-    if (!s || s->dead || s->executed) return;
-    // gather args
+    if (!s || s->dead) return;
+    if (s->argc != s->arg_count) {
+        fprintf(stderr, "Error: Argument count mismatch (%d vs %d)\n", s->argc, s->arg_count);
+        return;
+    }
+    int arg_types[MAX_ARGS] = {0};
     for (int i = 0; i < s->argc; ++i) {
         int ai = s->arg_indices[i];
-        if (ai < 0 || ai >= var_count) { args_buffer[i] = 0; continue; }
+        if (ai < 0 || ai >= var_count) { args_buffer[i] = 0; arg_types[i] = 0; continue; }
         VarSlot* a = env[ai];
-        if (!a) { args_buffer[i] = 0; continue; }
-        args_buffer[i] = a->constant ? a->value : (long)a->data;
+        if (!a) { args_buffer[i] = 0; arg_types[i] = 0; continue; }
+        void* func_ptr = NULL;
+        size_t flen;
+        int arg_count;
+        if (a->data) {
+            func_ptr = get_func_ptr((char*)a->data, &arg_count, &flen);
+        }
+        args_buffer[i] = func_ptr ? (long)func_ptr : a->value;
+        arg_types[i] = func_ptr ? 1 : 0;
     }
     VarSlot* lhs = env[s->lhs_index];
     if (!lhs) return;
-      else if (s->func_ptr) {
-        // expected signature: void fn(long* out, long* args)
-        void (*fn)(long*, long*) = s->func_ptr;
-        fn(&lhs->value, args_buffer);
-        lhs->constant = 0;
-    } else {
-        // unknown operation
-        lhs->constant = 0;
+    if (s->func_ptr) {
+        void (*fn)(long*, long*, int*) = s->func_ptr;
+        fn(&lhs->value, args_buffer, arg_types);
     }
-    s->executed = 1;
 }
 
 //
@@ -505,7 +525,11 @@ static void cleanup_all() {
     if (var_table) { free(var_table); var_table = NULL; }
     if (fixed_pool) { free(fixed_pool); fixed_pool = NULL; }
     VarPoolChunk* c = dynamic_pool;
-    while (c) { VarPoolChunk* nx = c->next; if (c->slots) free(c->slots); c = nx; }
+    while (c) {
+        VarPoolChunk* nx = c->next;
+        if (c->slots) free(c->slots);
+        c = nx;
+    }
     dynamic_pool = NULL;
     if (func_table) {
         for (int i = 0; i < func_count; ++i)
@@ -513,43 +537,56 @@ static void cleanup_all() {
                 munmap(func_table[i].ptr, func_table[i].len);
         free(func_table); func_table = NULL;
     }
-    arena_reset();
+    arena_free();  // Changed from arena_reset
 }
-
-static void atexit_cleanup() { cleanup_all(); }
 
 //
 // Parser: lines of form
 //   var = func(arg1, arg2, ...);
 // comments: lines starting with -- or empty
 //
-static IRStmt* parse_line(const char* line, IR* ir) {
+static int parse_line(const char* line, IR* ir, int line_num) {
     const char* p = line;
     while (isspace((unsigned char)*p)) ++p;
-    if (*p == '\0') return NULL;
-    if (p[0] == '-' && p[1] == '-') return NULL;
+    if (*p == '\0' || (p[0] == '-' && p[1] == '-')) return 0;  // Empty or comment
     // find '='
     const char* eq = strchr(p, '=');
-    if (!eq) { fprintf(stderr, "Parse error: no '=' in line: %s\n", line); return NULL; }
+    if (!eq) {
+        fprintf(stderr, "Parse error at line %d: no '=' in line: %s\n", line_num, line);
+        return -1;
+    }
     // LHS
     const char* q = eq - 1;
     while (q >= p && isspace((unsigned char)*q)) --q;
     const char* lhs_start = p;
     size_t lhs_len = (q >= p) ? (size_t)(q - p + 1) : 0;
-    if (lhs_len == 0 || lhs_len >= MAX_NAME_LEN) { fprintf(stderr, "Parse error: bad LHS\n"); return NULL; }
-    char lhs[MAX_NAME_LEN]; strncpy(lhs, lhs_start, lhs_len); lhs[lhs_len] = '\0';
+    if (lhs_len == 0 || lhs_len >= MAX_NAME_LEN) {
+        fprintf(stderr, "Parse error at line %d: bad LHS\n", line_num);
+        return -1;
+    }
+    char lhs[MAX_NAME_LEN];
+    strncpy(lhs, lhs_start, lhs_len);
+    lhs[lhs_len] = '\0';
     // find '(' and trailing ';'
     const char* paren = strchr(eq, '(');
     const char* semi = strchr(eq, ';');
-    if (!paren || !semi || semi < paren) { fprintf(stderr, "Parse error: bad call syntax\n"); return NULL; }
+    if (!paren || !semi || semi < paren) {
+        fprintf(stderr, "Parse error at line %d: bad call syntax\n", line_num);
+        return -1;
+    }
     // function name between eq+1 and paren-1
     const char* fname_start = eq + 1;
     while (isspace((unsigned char)*fname_start)) ++fname_start;
     const char* ftmp = paren - 1;
     while (ftmp > fname_start && isspace((unsigned char)*ftmp)) --ftmp;
     size_t fnlen = (size_t)(ftmp - fname_start + 1);
-    if (fnlen == 0 || fnlen >= MAX_NAME_LEN) { fprintf(stderr, "Parse error: bad func name\n"); return NULL; }
-    char fname[MAX_NAME_LEN]; strncpy(fname, fname_start, fnlen); fname[fnlen] = '\0';
+    if (fnlen == 0 || fnlen >= MAX_NAME_LEN) {
+        fprintf(stderr, "Parse error at line %d: bad func name\n", line_num);
+        return -1;
+    }
+    char fname[MAX_NAME_LEN];
+    strncpy(fname, fname_start, fnlen);
+    fname[fnlen] = '\0';
     // args between paren+1 and semi-1
     const char* args_start = paren + 1;
     const char* args_end = semi - 1;
@@ -559,27 +596,47 @@ static IRStmt* parse_line(const char* line, IR* ir) {
     char* argsbuf = NULL;
     if (args_len > 0) {
         argsbuf = malloc(args_len + 1);
-        if (!argsbuf) { perror("malloc argsbuf"); exit(EXIT_FAILURE); }
+        if (!argsbuf) {
+            perror("malloc argsbuf");
+            return -1;  // Don't exit, let caller handle
+        }
         strncpy(argsbuf, args_start, args_len);
         argsbuf[args_len] = '\0';
     } else {
         argsbuf = strdup("");
+        if (!argsbuf) {
+            perror("strdup argsbuf");
+            return -1;
+        }
     }
     // tokenize by comma
     int arg_count = 0;
     int arg_indices[MAX_ARGS];
     char* tok = strtok(argsbuf, ",");
-    while (tok && arg_count < MAX_ARGS) {
+    while (tok) {
+        if (arg_count >= MAX_ARGS) {
+            fprintf(stderr, "Parse error at line %d: too many arguments\n", line_num);
+            free(argsbuf);
+            return -1;
+        }
         // trim
         while (isspace((unsigned char)*tok)) ++tok;
         char* end = tok + strlen(tok) - 1;
-        while (end > tok && isspace((unsigned char)*end)) { *end = '\0'; --end; }
-        if (*tok == '\0') { tok = strtok(NULL, ","); continue; }
+        while (end > tok && isspace((unsigned char)*end)) {
+            *end = '\0';
+            --end;
+        }
+        if (*tok == '\0') {
+            tok = strtok(NULL, ",");
+            continue;
+        }
         arg_indices[arg_count++] = var_index(tok);
         tok = strtok(NULL, ",");
     }
     free(argsbuf);
+    // Allocate statement only after validation
     IRStmt* s = ir_alloc_stmt(ir);
+    s->dead = 0;  // Explicitly set
     s->lhs_index = var_index(lhs);
     s->argc = arg_count;
     s->arg_indices = arg_alloc(arg_count);
@@ -588,55 +645,70 @@ static IRStmt* parse_line(const char* line, IR* ir) {
     s->func_ptr = get_func_ptr(fname, &s->arg_count, &flen);
     if (!s->func_ptr) {
         if (strict_mode) {
-            fprintf(stderr, "Error: function '%s' not found. Execution stopped due to strict mode.\n", fname);
-            exit(EXIT_FAILURE);
+            fprintf(stderr, "Error at line %d: function '%s' not found. Execution stopped.\n", line_num, fname);
+            return -1;
         } else {
-            fprintf(stderr, "Warning: function '%s' not found. Execution will skip this op.\n", fname);
+            fprintf(stderr, "Warning at line %d: function '%s' not found. Skipping.\n", line_num, fname);
             s->dead = 1;
         }
     }
-    s->inlined = 0;
-    s->executed = 0;
-    return s;
-    }
+    return 0;
+}
     
 static IR* parse_script_file(const char* path) {
     FILE* f = fopen(path, "r");
-    if (!f) { perror("fopen script"); return NULL; }
+    if (!f) {
+        perror("fopen script");
+        return NULL;
+    }
     IR* ir = malloc(sizeof(IR));
+    if (!ir) {
+        fclose(f);
+        perror("malloc IR");
+        return NULL;
+    }
     ir_init(ir);
+    if (!ir) {  // Defensive check, though ir_init is unlikely to fail
+        fclose(f);
+        free(ir);
+        fprintf(stderr, "Error: IR initialization failed for %s\n", path);
+        return NULL;
+    }
     char* line = NULL;
     size_t ls = 0;
-    while (getline(&line, &ls, f) != -1) {
-        parse_line(line, ir);
+    int line_num = 1;
+    ssize_t read;
+    while ((read = getline(&line, &ls, f)) != -1) {
+        if (parse_line(line, ir, line_num) == -1) {
+            if (strict_mode) {
+                fprintf(stderr, "Parse error in %s at line %d: %s\n", path, line_num, line);
+                free(line);
+                fclose(f);
+                if (ir->stmts) free(ir->stmts);
+                free(ir);
+                return NULL;
+            }
+            // In non-strict mode, continue parsing
+        }
+        line_num++;
+    }
+    if (ferror(f)) {
+        fprintf(stderr, "Error reading %s: getline failed\n", path);
+        free(line);
+        fclose(f);
+        if (ir->stmts) free(ir->stmts);
+        free(ir);
+        return NULL;
     }
     free(line);
     fclose(f);
+    if (ir->count == 0) {
+        fprintf(stderr, "Warning: no valid statements in %s\n", path);
+        if (ir->stmts) free(ir->stmts);
+        free(ir);
+        return NULL;
+    }
     return ir;
-}
-
-//
-// Command line parse
-//
-static void parse_args(int argc, char** argv, char** script_path, int* max_threads) {
-    *script_path = NULL;
-    *max_threads = sysconf(_SC_NPROCESSORS_ONLN);
-    if (*max_threads <= 0) *max_threads = 8;
-    for (int i = 1; i < argc; ++i) {
-        if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
-            FIXED_VARS = atoi(argv[i] + 13);
-            if (FIXED_VARS <= 0) FIXED_VARS = DEFAULT_FIXED_VARS;
-        } else if (strncmp(argv[i], "--table-size=", 13) == 0) {
-            var_table_size = atoi(argv[i] + 13);
-            if (var_table_size <= 0) var_table_size = 4096;
-        } else if (argv[i][0] != '-') {
-            *script_path = argv[i];
-        }
-    }
-    if (!*script_path) {
-        fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N]\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
 }
 
 static void run_script(const char* path) {
@@ -676,22 +748,28 @@ int main(int argc, char **argv) {
 
     // Parse command-line arguments
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
-            FIXED_VARS = atoi(argv[i] + 13);
-            if (FIXED_VARS <= 0) FIXED_VARS = DEFAULT_FIXED_VARS;
-        } else if (strncmp(argv[i], "--table-size=", 13) == 0) {
-            var_table_size = atoi(argv[i] + 13);
-            if (var_table_size <= 0) var_table_size = 4096;
-        } else if (strcmp(argv[i], "--preload") == 0) {
-            preload_all = 1;
-        } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
-            preload_list = argv[i] + 15; // skip "list:"
-        } else if (strcmp(argv[i], "--strict") == 0) {
-            strict_mode = 1;
-        } else if (argv[i][0] != '-') {
-            script_path = argv[i];
+    if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
+        FIXED_VARS = atoi(argv[i] + 13);
+        if (FIXED_VARS <= 0) FIXED_VARS = DEFAULT_FIXED_VARS;
+    } else if (strncmp(argv[i], "--table-size=", 13) == 0) {
+        var_table_size = atoi(argv[i] + 13);
+        if (var_table_size <= 0) {
+            var_table_size = 4096;
+            fprintf(stderr, "Warning: Invalid table-size, using default 4096\n");
+        } else if ((var_table_size & (var_table_size - 1)) != 0) {
+            var_table_size = 1 << (32 - __builtin_clz(var_table_size - 1));
+            fprintf(stderr, "Warning: table-size rounded to power of two: %d\n", var_table_size);
         }
+    } else if (strcmp(argv[i], "--preload") == 0) {
+        preload_all = 1;
+    } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
+        preload_list = argv[i] + 15; // skip "list:"
+    } else if (strcmp(argv[i], "--strict") == 0) {
+        strict_mode = 1;
+    } else if (argv[i][0] != '-') {
+        script_path = argv[i];
     }
+}
 
     if (!script_path) {
         fprintf(stderr, "Error: no script specified\n");
