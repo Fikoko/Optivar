@@ -27,7 +27,6 @@ static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 #define FIXED_ARG_POOL 256
 #define MAX_NAME_LEN 128
 #define CACHE_LINE 64
-#define MAX_ARGS 16
 #define MIN_BIN_SIZE 16
 #define BIN_MAGIC 0xDEADBEEF
 
@@ -316,25 +315,38 @@ static void preload_binfuncs(const char* dirpath) {
 
 static void* get_func_ptr(const char* name, int* arg_count_out, size_t* len_out) {
     if (!func_table) {
-        *arg_count_out = -1; *len_out = 0;
+        *arg_count_out = -1;  // -1 signals unlimited arguments
+        *len_out = 0;
         return NULL;
     }
+
     for (int i = 0; i < func_count; ++i) {
         if (strcmp(func_table[i].name, name) == 0) {
+            // Lazy-load the function if not loaded
             if (!func_table[i].ptr) {
                 func_table[i].ptr = load_binfunc(name, &func_table[i].arg_count, &func_table[i].len);
                 if (!func_table[i].ptr) {
-                    *arg_count_out = -1; *len_out = 0;
+                    *arg_count_out = -1;
+                    *len_out = 0;
                     return NULL;
                 }
             }
-            *arg_count_out = func_table[i].arg_count;
+
+            // If arg_count is negative (e.g., -1), treat as unlimited
+            if (func_table[i].arg_count < 0) {
+                *arg_count_out = -1;  // unlimited
+            } else {
+                *arg_count_out = func_table[i].arg_count;
+            }
+
             *len_out = func_table[i].len;
-            void* p = func_table[i].ptr;
-            return p;
+            return func_table[i].ptr;
         }
     }
-    *arg_count_out = -1; *len_out = 0;
+
+    // Function not found
+    *arg_count_out = -1;  // unlimited
+    *len_out = 0;
     return NULL;
 }
 
@@ -368,22 +380,12 @@ typedef struct ArgBlock {
 static ArgBlock* arg_blocks = NULL;
 
 static int* arg_alloc(int n) {
-    // check if current block has enough space
-    if (!arg_blocks || arg_blocks->capacity - arg_blocks->used < n) {
-        int cap = (n > FIXED_ARG_POOL) ? n : FIXED_ARG_POOL;
-        ArgBlock* nb = arena_alloc(sizeof(ArgBlock));
-        nb->args = arena_alloc(sizeof(int) * cap);
-        nb->capacity = cap;
-        nb->used = 0;
-        nb->next = arg_blocks;
-        arg_blocks = nb;
-    }
-
-    // allocate from current block
-    int* out = arg_blocks->args + arg_blocks->used;
-    arg_blocks->used += n;
-    return out;
+    if (n <= 0) return NULL;
+    int* arr = arena_alloc(sizeof(int) * n);
+    if (!arr) { perror("arena_alloc arg"); exit(EXIT_FAILURE); }
+    return arr;
 }
+
 
 // reset function (optional)
 static void free_arg_blocks() {
@@ -475,42 +477,77 @@ static void init_env(int total_vars) {
 
 static void execute_single(IRStmt* s, VarSlot** env, long* args_buffer) {
     if (!s || s->dead) return;
-    if (s->argc != s->arg_count) {
-        fprintf(stderr, "Error: Argument count mismatch (%d vs %d)\n", s->argc, s->arg_count);
-        return;
+
+    // allocate arg_types dynamically
+    int* arg_types = NULL;
+    if (s->argc > 0) {
+        arg_types = malloc(sizeof(int) * s->argc);
+        if (!arg_types) {
+            perror("malloc arg_types");
+            return;
+        }
     }
-    int arg_types[MAX_ARGS] = {0};
+
     for (int i = 0; i < s->argc; ++i) {
         int ai = s->arg_indices[i];
-        if (ai < 0 || ai >= var_count) { args_buffer[i] = 0; arg_types[i] = 0; continue; }
+        if (ai < 0 || ai >= var_count) {
+            args_buffer[i] = 0;
+            arg_types[i] = 0;
+            continue;
+        }
+
         VarSlot* a = env[ai];
         if (!a) { args_buffer[i] = 0; arg_types[i] = 0; continue; }
+
         void* func_ptr = NULL;
         size_t flen;
         int arg_count;
         if (a->data) {
             func_ptr = get_func_ptr((char*)a->data, &arg_count, &flen);
         }
+
         args_buffer[i] = func_ptr ? (long)func_ptr : a->value;
         arg_types[i] = func_ptr ? 1 : 0;
     }
+
     VarSlot* lhs = env[s->lhs_index];
-    if (!lhs) return;
+    if (!lhs) {
+        free(arg_types);
+        return;
+    }
+
     if (s->func_ptr) {
         void (*fn)(long*, long*, int*) = s->func_ptr;
         fn(&lhs->value, args_buffer, arg_types);
     }
+
+    free(arg_types);
 }
 
 //
 // executor entry
 //
 static void executor(IRStmt* stmts, int stmt_count, VarSlot** env) {
-    long args_buffer[MAX_ARGS];
     for (int i = 0; i < stmt_count; ++i) {
-        execute_single(&stmts[i], env, args_buffer);
+        IRStmt* s = &stmts[i];
+        if (!s || s->dead) continue;
+
+        // allocate args buffer dynamically for this statement
+        long* args_buffer = NULL;
+        if (s->argc > 0) {
+            args_buffer = malloc(sizeof(long) * s->argc);
+            if (!args_buffer) {
+                perror("malloc args_buffer");
+                continue;
+            }
+        }
+
+        execute_single(s, env, args_buffer);
+
+        free(args_buffer);
     }
 }
+
 
 // ----------------------
 // Cleanup (robust)
@@ -549,32 +586,34 @@ static int parse_line(const char* line, IR* ir, int line_num) {
     const char* p = line;
     while (isspace((unsigned char)*p)) ++p;
     if (*p == '\0' || (p[0] == '-' && p[1] == '-')) return 0;  // Empty or comment
+
     // find '='
     const char* eq = strchr(p, '=');
     if (!eq) {
         fprintf(stderr, "Parse error at line %d: no '=' in line: %s\n", line_num, line);
         return -1;
     }
+
     // LHS
     const char* q = eq - 1;
     while (q >= p && isspace((unsigned char)*q)) --q;
-    const char* lhs_start = p;
     size_t lhs_len = (q >= p) ? (size_t)(q - p + 1) : 0;
     if (lhs_len == 0 || lhs_len >= MAX_NAME_LEN) {
         fprintf(stderr, "Parse error at line %d: bad LHS\n", line_num);
         return -1;
     }
     char lhs[MAX_NAME_LEN];
-    strncpy(lhs, lhs_start, lhs_len);
+    strncpy(lhs, p, lhs_len);
     lhs[lhs_len] = '\0';
-    // find '(' and trailing ';'
+
+    // function name
     const char* paren = strchr(eq, '(');
     const char* semi = strchr(eq, ';');
     if (!paren || !semi || semi < paren) {
         fprintf(stderr, "Parse error at line %d: bad call syntax\n", line_num);
         return -1;
     }
-    // function name between eq+1 and paren-1
+
     const char* fname_start = eq + 1;
     while (isspace((unsigned char)*fname_start)) ++fname_start;
     const char* ftmp = paren - 1;
@@ -587,74 +626,70 @@ static int parse_line(const char* line, IR* ir, int line_num) {
     char fname[MAX_NAME_LEN];
     strncpy(fname, fname_start, fnlen);
     fname[fnlen] = '\0';
+
     // args between paren+1 and semi-1
     const char* args_start = paren + 1;
     const char* args_end = semi - 1;
     while (args_start <= args_end && isspace((unsigned char)*args_start)) ++args_start;
     while (args_end >= args_start && isspace((unsigned char)*args_end)) --args_end;
     size_t args_len = (args_end >= args_start) ? (size_t)(args_end - args_start + 1) : 0;
+
     char* argsbuf = NULL;
     if (args_len > 0) {
         argsbuf = malloc(args_len + 1);
-        if (!argsbuf) {
-            perror("malloc argsbuf");
-            return -1;  // Don't exit, let caller handle
-        }
+        if (!argsbuf) { perror("malloc argsbuf"); return -1; }
         strncpy(argsbuf, args_start, args_len);
         argsbuf[args_len] = '\0';
     } else {
         argsbuf = strdup("");
-        if (!argsbuf) {
-            perror("strdup argsbuf");
-            return -1;
-        }
+        if (!argsbuf) { perror("strdup argsbuf"); return -1; }
     }
-    // tokenize by comma
+
+    // dynamically growable arg_indices
+    int arg_capacity = 8; // initial capacity
     int arg_count = 0;
-    int arg_indices[MAX_ARGS];
+    int* arg_indices = malloc(sizeof(int) * arg_capacity);
+    if (!arg_indices) { perror("malloc arg_indices"); free(argsbuf); return -1; }
+
     char* tok = strtok(argsbuf, ",");
     while (tok) {
-        if (arg_count >= MAX_ARGS) {
-            fprintf(stderr, "Parse error at line %d: too many arguments\n", line_num);
-            free(argsbuf);
-            return -1;
-        }
-        // trim
         while (isspace((unsigned char)*tok)) ++tok;
         char* end = tok + strlen(tok) - 1;
-        while (end > tok && isspace((unsigned char)*end)) {
-            *end = '\0';
-            --end;
+        while (end > tok && isspace((unsigned char)*end)) { *end = '\0'; --end; }
+        if (*tok != '\0') {
+            if (arg_count >= arg_capacity) {
+                arg_capacity *= 2;
+                int* tmp = realloc(arg_indices, sizeof(int) * arg_capacity);
+                if (!tmp) { perror("realloc arg_indices"); free(arg_indices); free(argsbuf); return -1; }
+                arg_indices = tmp;
+            }
+            arg_indices[arg_count++] = var_index(tok);
         }
-        if (*tok == '\0') {
-            tok = strtok(NULL, ",");
-            continue;
-        }
-        arg_indices[arg_count++] = var_index(tok);
         tok = strtok(NULL, ",");
     }
     free(argsbuf);
-    // Allocate statement only after validation
+
     IRStmt* s = ir_alloc_stmt(ir);
-    s->dead = 0;  // Explicitly set
+    s->dead = 0;
     s->lhs_index = var_index(lhs);
     s->argc = arg_count;
-    s->arg_indices = arg_alloc(arg_count);
-    memcpy(s->arg_indices, arg_indices, sizeof(int) * arg_count);
+    s->arg_indices = arg_indices;
+
     size_t flen = 0;
     s->func_ptr = get_func_ptr(fname, &s->arg_count, &flen);
     if (!s->func_ptr) {
         if (strict_mode) {
-            fprintf(stderr, "Error at line %d: function '%s' not found. Execution stopped.\n", line_num, fname);
+            fprintf(stderr, "Error at line %d: function '%s' not found.\n", line_num, fname);
             return -1;
         } else {
             fprintf(stderr, "Warning at line %d: function '%s' not found. Skipping.\n", line_num, fname);
             s->dead = 1;
         }
     }
+
     return 0;
 }
-    
+
 static IR* parse_script_file(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) {
