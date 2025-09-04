@@ -16,15 +16,13 @@
 #include <zlib.h>
 #include <limits.h>
 #include <assert.h>
-static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
-static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 
 //
 // Tunables
 //
 #define DEFAULT_FIXED_VARS 4096
 #define VAR_CHUNK_SIZE 8192
-#define FIXED_ARG_POOL 256
+#define FIXED_ARG_POOL 8
 #define MAX_NAME_LEN 128
 #define CACHE_LINE 64
 #define MIN_BIN_SIZE 16
@@ -50,19 +48,37 @@ typedef struct VarSlot {
 
 typedef struct IRStmt {
     int lhs_index;
-    void* func_ptr;        // mapped function pointer or NULL
+    void* func_ptr;        // kept for backward compatibility
     int argc;
     int* arg_indices;      // indices into env_array
     int dead;
-    char pad[CACHE_LINE - 3*sizeof(int) - sizeof(void*) - sizeof(int*)];
+    char func_name[MAX_NAME_LEN]; // NEW: store the function name
+    struct IRStmt* sub_stmts; // nested statements
+    int sub_count;            // number of nested statements
+    char pad[CACHE_LINE - 4*sizeof(int) - sizeof(void*) - sizeof(int*) - MAX_NAME_LEN - sizeof(struct IRStmt*) - sizeof(int)];
 } IRStmt;
 
-typedef struct ArgEntry {
-    VarSlot* lhs;       // pointer to left-hand-side variable
-    void* func_ptr;     // pointer to function (bin)
-    int argc;           // number of arguments
-    VarSlot** args;     // array of pointers to argument VarSlots
-} ArgEntry;
+// Add static assertions after type definitions
+static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
+static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
+
+// Forward declarations
+struct BinContext;
+struct IRStmt;
+
+// Enhanced bin function signature with context for bin-to-bin calls
+typedef void (*BinFunc)(long* lhs, long* args, 
+                       struct IRStmt* sub_stmts, int sub_count,
+                       struct BinContext* ctx);
+
+// Context passed to bin functions for direct bin-to-bin calls
+typedef struct BinContext {
+    VarSlot** env;           // Full environment access
+    struct FuncEntry* func_table;   // For bin-to-bin calls
+    int func_count;
+    long* temp_buffer;       // Temporary buffer for arguments
+    size_t temp_buffer_size;
+} BinContext;
 
 typedef struct IR {
     IRStmt* stmts;
@@ -101,7 +117,7 @@ static HashNode** var_table = NULL;
 //
 // Function table for .bin functions
 //
-typedef struct {
+typedef struct FuncEntry {
     char name[MAX_NAME_LEN];
     void* ptr;
     size_t len;
@@ -114,9 +130,6 @@ static int func_count = 0;
 
 //
 // Bin header
-// Note: .bin functions have signature void fn(long* out, long* args).
-//       args[i] may be a function pointer (if the argument matches a func_table entry)
-//       or a value (VarSlot->value for non-function variables).
 //
 typedef struct {
     uint32_t magic;
@@ -181,7 +194,6 @@ static void arena_free() {
     arena_size = 0;
     arena_used = 0;
 }
-
 
 //
 // Pool allocator for VarSlot
@@ -264,27 +276,46 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
     char path[512];
     snprintf(path, sizeof(path), "./funcs/%s.bin", name);
     struct stat st;
-    if (stat(path, &st) != 0) { fprintf(stderr, "Error: %s not found\n", path); return NULL; }
+    if (stat(path, &st) != 0) { 
+        if (!strict_mode) {
+            return NULL;  // Silently return NULL in non-strict mode
+        }
+        fprintf(stderr, "Error: %s not found\n", path); 
+        return NULL; 
+    }
 
-    if (st.st_size < sizeof(BinHeader) + MIN_BIN_SIZE) { fprintf(stderr, "Error: %s too small\n", path); return NULL; }
+    if (st.st_size < sizeof(BinHeader) + MIN_BIN_SIZE) { 
+        fprintf(stderr, "Error: %s too small\n", path); 
+        return NULL; 
+    }
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open bin"); return NULL; }
 
     BinHeader hdr;
-    if (read(fd, &hdr, sizeof(BinHeader)) != (ssize_t)sizeof(BinHeader)) { perror("read header"); close(fd); return NULL; }
-    if (hdr.magic != BIN_MAGIC) { fprintf(stderr, "Error: bad magic in %s\n", path); close(fd); return NULL; }
+    if (read(fd, &hdr, sizeof(BinHeader)) != (ssize_t)sizeof(BinHeader)) { 
+        perror("read header"); 
+        close(fd); 
+        return NULL; 
+    }
+    if (hdr.magic != BIN_MAGIC) { 
+        fprintf(stderr, "Error: bad magic in %s\n", path); 
+        close(fd); 
+        return NULL; 
+    }
 
     size_t code_size = st.st_size - sizeof(BinHeader);
     void* mapped = mmap(NULL, code_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, sizeof(BinHeader));
     if (mapped == MAP_FAILED) { perror("mmap"); close(fd); return NULL; }
-    if (((uintptr_t)mapped % sysconf(_SC_PAGESIZE)) != 0) {
-        fprintf(stderr, "Warning: mmap not page-aligned for %s\n", path);
-    }
 
     // CRC check in-place
     uint32_t crc = crc32(0, (unsigned char*)mapped, code_size);
-    if (crc != hdr.code_crc) { fprintf(stderr, "CRC mismatch %s\n", path); munmap(mapped, code_size); close(fd); return NULL; }
+    if (crc != hdr.code_crc) { 
+        fprintf(stderr, "CRC mismatch %s\n", path); 
+        munmap(mapped, code_size); 
+        close(fd); 
+        return NULL; 
+    }
 
     close(fd);
     *arg_count_out = hdr.arg_count;
@@ -405,11 +436,10 @@ static int var_index(const char* name) {
     unsigned int h = hash_name(name, var_table_size);
     HashNode* node = var_table[h];
     while (node) {
-            if (strcmp(node->name, name) == 0) {
-        return node->index;   // O(1) now
+        if (strcmp(node->name, name) == 0) {
+            return node->index;   // O(1) now
         }
-    node = node->next;
-
+        node = node->next;
     }
     // add new var
     VarSlot* s = pool_alloc();
@@ -451,71 +481,341 @@ static void init_env(int total_vars) {
     memset(fixed_pool, 0, sizeof(VarSlot) * FIXED_VARS);
 }
 
-// ir_to_argentries
-static ArgEntry* ir_to_argentries(IRStmt* stmts, int count, VarSlot** env) {
-    if (count <= 0) return NULL;
-    ArgEntry* entries = malloc(sizeof(ArgEntry) * count);
-    if (!entries) { perror("malloc ArgEntry"); exit(EXIT_FAILURE); }
+//
+// Enhanced parser that supports nested statements
+//
+static int parse_expression(const char* expr, int expr_len, IR* nested_ir);
 
-    for (int i = 0; i < count; ++i) {
-        IRStmt* s = &stmts[i];
-        entries[i].lhs = env[s->lhs_index];
-        entries[i].func_ptr = s->func_ptr;
-        entries[i].argc = s->argc;
-        if (s->argc > 0) {
-            entries[i].args = arena_alloc(sizeof(VarSlot*) * s->argc);
-            for (int j = 0; j < s->argc; ++j) entries[i].args[j] = env[s->arg_indices[j]];
-        } else {
-            entries[i].args = NULL;
-        }
+static int find_matching_paren(const char* str, int start) {
+    int paren_count = 1;
+    int pos = start + 1;
+    while (str[pos] && paren_count > 0) {
+        if (str[pos] == '(') paren_count++;
+        else if (str[pos] == ')') paren_count--;
+        pos++;
     }
-    return entries;
+    return (paren_count == 0) ? pos - 1 : -1;
 }
 
+static int parse_expression(const char* expr, int expr_len, IR* nested_ir) {
+    // Look for assignment pattern: var = func(args)
+    const char* eq = NULL;
+    for (int i = 0; i < expr_len; i++) {
+        if (expr[i] == '=') {
+            eq = expr + i;
+            break;
+        }
+    }
+    
+    if (!eq) return -1; // Not an assignment
+    
+    // Parse LHS variable
+    const char* lhs_start = expr;
+    const char* lhs_end = eq - 1;
+    while (lhs_start < lhs_end && isspace(*lhs_start)) lhs_start++;
+    while (lhs_end > lhs_start && isspace(*lhs_end)) lhs_end--;
+    
+    if (lhs_start >= lhs_end) return -1;
+    
+    int lhs_len = lhs_end - lhs_start + 1;
+    char lhs[MAX_NAME_LEN];
+    if (lhs_len >= MAX_NAME_LEN) return -1;
+    strncpy(lhs, lhs_start, lhs_len);
+    lhs[lhs_len] = '\0';
+    
+    // Find function name and arguments
+    const char* rhs = eq + 1;
+    while (isspace(*rhs)) rhs++;
+    
+    const char* paren = strchr(rhs, '(');
+    if (!paren) return -1;
+    
+    // Extract function name
+    const char* fname_end = paren - 1;
+    while (fname_end > rhs && isspace(*fname_end)) fname_end--;
+    int fname_len = fname_end - rhs + 1;
+    if (fname_len <= 0 || fname_len >= MAX_NAME_LEN) return -1;
+    
+    char fname[MAX_NAME_LEN];
+    strncpy(fname, rhs, fname_len);
+    fname[fname_len] = '\0';
+    
+    // Find matching closing paren
+    int close_paren = find_matching_paren(rhs, paren - rhs);
+    if (close_paren < 0) return -1;
+    
+    // Parse arguments (which may be nested statements)
+    const char* args_start = paren + 1;
+    const char* args_end = rhs + close_paren - 1;
+    
+    // Skip whitespace
+    while (args_start < args_end && isspace(*args_start)) args_start++;
+    while (args_end > args_start && isspace(*args_end)) args_end--;
+    
+    // Create IR statement
+    IRStmt* stmt = ir_alloc_stmt(nested_ir);
+    stmt->lhs_index = var_index(lhs);
+    strncpy(stmt->func_name, fname, MAX_NAME_LEN);
+    
+    // Parse arguments - they can be either simple variables or nested expressions
+    if (args_start < args_end) {
+        // Count arguments first
+        int arg_count = 0;
+        int paren_depth = 0;
+        const char* arg_start = args_start;
+        
+        for (const char* p = args_start; p <= args_end; p++) {
+            if (*p == '(') paren_depth++;
+            else if (*p == ')') paren_depth--;
+            else if (*p == ',' && paren_depth == 0) {
+                arg_count++;
+            }
+        }
+        if (arg_start <= args_end) arg_count++; // Last argument
+        
+        // Allocate argument arrays
+        stmt->argc = arg_count;
+        stmt->arg_indices = malloc(sizeof(int) * arg_count);
+        if (!stmt->arg_indices) { perror("malloc arg_indices"); return -1; }
+        
+        // Parse each argument
+        int current_arg = 0;
+        paren_depth = 0;
+        arg_start = args_start;
+        
+        for (const char* p = args_start; p <= args_end + 1; p++) {
+            if (p <= args_end && *p == '(') paren_depth++;
+            else if (p <= args_end && *p == ')') paren_depth--;
+            else if ((p > args_end || (*p == ',' && paren_depth == 0)) && current_arg < arg_count) {
+                // Found end of argument
+                const char* arg_end = (p > args_end) ? args_end : p - 1;
+                
+                // Trim whitespace
+                while (arg_start < arg_end && isspace(*arg_start)) arg_start++;
+                while (arg_end > arg_start && isspace(*arg_end)) arg_end--;
+                
+                int arg_len = arg_end - arg_start + 1;
+                
+                // Check if this argument contains an assignment (nested statement)
+                bool is_nested = false;
+                int nested_paren_depth = 0;
+                for (const char* q = arg_start; q <= arg_end; q++) {
+                    if (*q == '(') nested_paren_depth++;
+                    else if (*q == ')') nested_paren_depth--;
+                    else if (*q == '=' && nested_paren_depth == 0) {
+                        is_nested = true;
+                        break;
+                    }
+                }
+                
+                if (is_nested) {
+                    // Parse as nested expression
+                    IR nested_stmt_ir;
+                    ir_init(&nested_stmt_ir);
+                    
+                    if (parse_expression(arg_start, arg_len, &nested_stmt_ir) == 0 && nested_stmt_ir.count > 0) {
+                        // This is a nested statement - use its LHS as the argument
+                        stmt->arg_indices[current_arg] = nested_stmt_ir.stmts[0].lhs_index;
+                        
+                        // Store nested statements for execution
+                        if (!stmt->sub_stmts) {
+                            stmt->sub_stmts = malloc(sizeof(IRStmt) * 16); // Initial capacity
+                            stmt->sub_count = 0;
+                        }
+                        
+                        // Reallocate if needed (simplified for this example)
+                        stmt->sub_stmts[stmt->sub_count] = nested_stmt_ir.stmts[0];
+                        stmt->sub_count++;
+                    } else {
+                        // Fallback - treat as simple variable
+                        char simple_var[MAX_NAME_LEN];
+                        if (arg_len < MAX_NAME_LEN) {
+                            strncpy(simple_var, arg_start, arg_len);
+                            simple_var[arg_len] = '\0';
+                            stmt->arg_indices[current_arg] = var_index(simple_var);
+                        }
+                    }
+                    
+                    // Clean up temporary IR
+                    if (nested_stmt_ir.stmts) free(nested_stmt_ir.stmts);
+                } else {
+                    // Simple variable argument
+                    char simple_var[MAX_NAME_LEN];
+                    if (arg_len < MAX_NAME_LEN) {
+                        strncpy(simple_var, arg_start, arg_len);
+                        simple_var[arg_len] = '\0';
+                        stmt->arg_indices[current_arg] = var_index(simple_var);
+                    }
+                }
+                
+                current_arg++;
+                arg_start = p + 1; // Start of next argument
+            }
+        }
+    } else {
+        stmt->argc = 0;
+        stmt->arg_indices = NULL;
+    }
+    
+    return 0;
+}
+
+static int parse_line_v3(const char* line, IR* ir, int line_num) {
+    const char* p = line;
+    while (isspace((unsigned char)*p)) ++p;
+    if (*p == '\0' || (p[0] == '-' && p[1] == '-')) return 0;  // Empty or comment
+
+    // Find semicolon
+    const char* semi = strchr(p, ';');
+    if (!semi) {
+        if (strict_mode) {
+            fprintf(stderr, "Parse error at line %d: no ';' in line: %s\n", line_num, line);
+            return -1;
+        }
+        return 0; // Skip in non-strict mode
+    }
+    
+    int line_len = semi - p;
+    return parse_expression(p, line_len, ir);
+}
+
+//
+// Enhanced executor with bin-to-bin support
+//
+static BinContext global_bin_context;
 static long* args_buffer = NULL;
 static size_t args_buffer_size = 0;
 
-//
-// executor entry
-//
-static void executor(IRStmt* stmts, int stmt_count, VarSlot** env) {
-    if (!stmts || stmt_count <= 0) return;
-
-    ArgEntry* entries = ir_to_argentries(stmts, stmt_count, env);
-    if (!entries) return;
-
-    for (int i = 0; i < stmt_count; ++i) {
-        ArgEntry* e = &entries[i];
-        if (!e->lhs || e->lhs->in_use == 0) continue;  // skip dead vars
-
-        if (e->func_ptr) {
-            // allocate/reuse argument buffer
-            if (e->argc > 0) {
-                if ((size_t)e->argc > args_buffer_size) {
-                    free(args_buffer);
-                    args_buffer = malloc(sizeof(long) * e->argc);
-                    if (!args_buffer) { perror("malloc args_buffer"); exit(EXIT_FAILURE); }
-                    args_buffer_size = e->argc;
-                }
-                for (int j = 0; j < e->argc; ++j) {
-                    args_buffer[j] = e->args[j] ? e->args[j]->value : 0;
-                }
+// Helper function for bin functions to call other bin functions
+void* optivar_get_func(struct BinContext* ctx, const char* name) {
+    if (!ctx || !ctx->func_table) return NULL;
+    
+    for (int i = 0; i < ctx->func_count; i++) {
+        if (strcmp(ctx->func_table[i].name, name) == 0) {
+            if (!ctx->func_table[i].ptr) {
+                int arg_count;
+                size_t len;
+                ctx->func_table[i].ptr = load_binfunc(name, &arg_count, &len);
+                ctx->func_table[i].arg_count = arg_count;
+                ctx->func_table[i].len = len;
             }
-
-            // call function: signature void fn(long* out, long* args, int* extra)
-            void (*fn)(long*, long*, int*) = e->func_ptr;
-            fn(&e->lhs->value, (e->argc > 0) ? args_buffer : NULL, NULL);
+            return ctx->func_table[i].ptr;
         }
     }
+    return NULL;
+}
 
-    // free ArgEntry args pointers (allocated from arena)
-    for (int i = 0; i < stmt_count; ++i) {
-        if (entries[i].args) free(entries[i].args);
+// Helper function for bin functions to execute nested statements
+void optivar_execute_stmts(struct BinContext* ctx, struct IRStmt* stmts, int count) {
+    if (!ctx || !stmts || count <= 0) return;
+    
+    for (int i = 0; i < count; i++) {
+        IRStmt* stmt = &stmts[i];
+        
+        // Resolve function pointer if needed
+        if (!stmt->func_ptr && stmt->func_name[0]) {
+            size_t len;
+            int arg_count;
+            stmt->func_ptr = get_func_ptr(stmt->func_name, &arg_count, &len);
+        }
+        
+        if (!stmt->func_ptr) {
+            if (strict_mode) {
+                fprintf(stderr, "Error: function '%s' not found\n", stmt->func_name);
+                continue;
+            }
+            continue; // Skip missing functions in non-strict mode
+        }
+        
+        // Prepare arguments
+        if ((size_t)stmt->argc > ctx->temp_buffer_size) {
+            ctx->temp_buffer_size = stmt->argc * 2;
+            ctx->temp_buffer = realloc(ctx->temp_buffer, sizeof(long) * ctx->temp_buffer_size);
+            if (!ctx->temp_buffer) { perror("realloc temp_buffer"); exit(EXIT_FAILURE); }
+        }
+        
+        for (int j = 0; j < stmt->argc; j++) {
+            int idx = stmt->arg_indices[j];
+            ctx->temp_buffer[j] = (idx >= 0 && ctx->env[idx]) ? ctx->env[idx]->value : 0;
+        }
+        
+        // Get LHS variable
+        VarSlot* lhs = (stmt->lhs_index >= 0) ? ctx->env[stmt->lhs_index] : NULL;
+        if (!lhs) continue;
+        
+        // Call the bin function
+        BinFunc fn = (BinFunc)stmt->func_ptr;
+        fn(&lhs->value, 
+           (stmt->argc > 0) ? ctx->temp_buffer : NULL,
+           stmt->sub_stmts, 
+           stmt->sub_count, 
+           ctx);
     }
-    free(entries);
+}
 
-    // args_buffer will persist and be reused in future calls
-    // free it in cleanup_all() to avoid leaks
+static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
+    if (!stmts || stmt_count <= 0) return;
+
+    // Initialize global bin context
+    global_bin_context.env = env;
+    global_bin_context.func_table = func_table;
+    global_bin_context.func_count = func_count;
+    global_bin_context.temp_buffer = NULL;
+    global_bin_context.temp_buffer_size = 0;
+
+    // Ensure main args buffer
+    if ((size_t)stmt_count * 16 > args_buffer_size) { // Estimate max args needed
+        args_buffer_size = stmt_count * 16;
+        args_buffer = realloc(args_buffer, sizeof(long) * args_buffer_size);
+        if (!args_buffer) { perror("realloc args_buffer"); exit(EXIT_FAILURE); }
+    }
+
+    // Execute each top-level statement
+    for (int i = 0; i < stmt_count; ++i) {
+        IRStmt* stmt = &stmts[i];
+        
+        if (stmt->dead || stmt->lhs_index < 0) continue;
+        
+        // Resolve function pointer if needed
+        if (!stmt->func_ptr && stmt->func_name[0]) {
+            size_t len;
+            int arg_count;
+            stmt->func_ptr = get_func_ptr(stmt->func_name, &arg_count, &len);
+        }
+        
+        if (!stmt->func_ptr) {
+            if (strict_mode) {
+                fprintf(stderr, "Error: function '%s' not found\n", stmt->func_name);
+                exit(EXIT_FAILURE);
+            }
+            continue; // Skip missing functions in non-strict mode
+        }
+
+        // Prepare arguments
+        for (int j = 0; j < stmt->argc; ++j) {
+            int idx = stmt->arg_indices[j];
+            args_buffer[j] = (idx >= 0 && env[idx]) ? env[idx]->value : 0;
+        }
+
+        // Get LHS variable
+        VarSlot* lhs = env[stmt->lhs_index];
+        if (!lhs) continue;
+
+        // Call the bin function with enhanced context
+        BinFunc fn = (BinFunc)stmt->func_ptr;
+        fn(&lhs->value,
+           (stmt->argc > 0) ? args_buffer : NULL,
+           stmt->sub_stmts,
+           stmt->sub_count,
+           &global_bin_context);
+    }
+    
+    // Cleanup temp buffer
+    if (global_bin_context.temp_buffer) {
+        free(global_bin_context.temp_buffer);
+        global_bin_context.temp_buffer = NULL;
+        global_bin_context.temp_buffer_size = 0;
+    }
 }
 
 static void cleanup_all() {
@@ -575,118 +875,8 @@ static void cleanup_all() {
 }
 
 //
-// Parser: lines of form
-//   var = func(arg1, arg2, ...);
-// comments: lines starting with -- or empty
+// Script parsing and execution
 //
-static int parse_line(const char* line, IR* ir, int line_num) {
-    const char* p = line;
-    while (isspace((unsigned char)*p)) ++p;
-    if (*p == '\0' || (p[0] == '-' && p[1] == '-')) return 0;  // Empty or comment
-
-    // find '='
-    const char* eq = strchr(p, '=');
-    if (!eq) {
-        fprintf(stderr, "Parse error at line %d: no '=' in line: %s\n", line_num, line);
-        return -1;
-    }
-
-    // LHS
-    const char* q = eq - 1;
-    while (q >= p && isspace((unsigned char)*q)) --q;
-    size_t lhs_len = (q >= p) ? (size_t)(q - p + 1) : 0;
-    if (lhs_len == 0 || lhs_len >= MAX_NAME_LEN) {
-        fprintf(stderr, "Parse error at line %d: bad LHS\n", line_num);
-        return -1;
-    }
-    char lhs[MAX_NAME_LEN];
-    strncpy(lhs, p, lhs_len);
-    lhs[lhs_len] = '\0';
-
-    // function name
-    const char* paren = strchr(eq, '(');
-    const char* semi = strchr(eq, ';');
-    if (!paren || !semi || semi < paren) {
-        fprintf(stderr, "Parse error at line %d: bad call syntax\n", line_num);
-        return -1;
-    }
-
-    const char* fname_start = eq + 1;
-    while (isspace((unsigned char)*fname_start)) ++fname_start;
-    const char* ftmp = paren - 1;
-    while (ftmp > fname_start && isspace((unsigned char)*ftmp)) --ftmp;
-    size_t fnlen = (size_t)(ftmp - fname_start + 1);
-    if (fnlen == 0 || fnlen >= MAX_NAME_LEN) {
-        fprintf(stderr, "Parse error at line %d: bad func name\n", line_num);
-        return -1;
-    }
-    char fname[MAX_NAME_LEN];
-    strncpy(fname, fname_start, fnlen);
-    fname[fnlen] = '\0';
-
-    // args between paren+1 and semi-1
-    const char* args_start = paren + 1;
-    const char* args_end = semi - 1;
-    while (args_start <= args_end && isspace((unsigned char)*args_start)) ++args_start;
-    while (args_end >= args_start && isspace((unsigned char)*args_end)) --args_end;
-    size_t args_len = (args_end >= args_start) ? (size_t)(args_end - args_start + 1) : 0;
-
-    char* argsbuf = NULL;
-    if (args_len > 0) {
-        argsbuf = malloc(args_len + 1);
-        if (!argsbuf) { perror("malloc argsbuf"); return -1; }
-        strncpy(argsbuf, args_start, args_len);
-        argsbuf[args_len] = '\0';
-    } else {
-        argsbuf = strdup("");
-        if (!argsbuf) { perror("strdup argsbuf"); return -1; }
-    }
-
-    // dynamically growable arg_indices
-    int arg_capacity = 8; // initial capacity
-    int arg_count = 0;
-    int* arg_indices = malloc(sizeof(int) * arg_capacity);
-    if (!arg_indices) { perror("malloc arg_indices"); free(argsbuf); return -1; }
-
-    char* tok = strtok(argsbuf, ",");
-    while (tok) {
-        while (isspace((unsigned char)*tok)) ++tok;
-        char* end = tok + strlen(tok) - 1;
-        while (end > tok && isspace((unsigned char)*end)) { *end = '\0'; --end; }
-        if (*tok != '\0') {
-            if (arg_count >= arg_capacity) {
-                arg_capacity *= 2;
-                int* tmp = realloc(arg_indices, sizeof(int) * arg_capacity);
-                if (!tmp) { perror("realloc arg_indices"); free(arg_indices); free(argsbuf); return -1; }
-                arg_indices = tmp;
-            }
-            arg_indices[arg_count++] = var_index(tok);
-        }
-        tok = strtok(NULL, ",");
-    }
-    free(argsbuf);
-
-    IRStmt* s = ir_alloc_stmt(ir);
-    s->dead = 0;
-    s->lhs_index = var_index(lhs);
-    s->argc = arg_count;
-    s->arg_indices = arg_indices;
-
-    size_t flen = 0;
-    s->func_ptr = get_func_ptr(fname, &s->arg_count, &flen);
-    if (!s->func_ptr) {
-        if (strict_mode) {
-            fprintf(stderr, "Error at line %d: function '%s' not found.\n", line_num, fname);
-            return -1;
-        } else {
-            fprintf(stderr, "Warning at line %d: function '%s' not found. Skipping.\n", line_num, fname);
-            s->dead = 1;
-        }
-    }
-
-    return 0;
-}
-
 static IR* parse_script_file(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) {
@@ -700,23 +890,25 @@ static IR* parse_script_file(const char* path) {
         return NULL;
     }
     ir_init(ir);
-    if (!ir) {  // Defensive check, though ir_init is unlikely to fail
-        fclose(f);
-        free(ir);
-        fprintf(stderr, "Error: IR initialization failed for %s\n", path);
-        return NULL;
-    }
+    
     char* line = NULL;
     size_t ls = 0;
     int line_num = 1;
     ssize_t read;
     while ((read = getline(&line, &ls, f)) != -1) {
-        if (parse_line(line, ir, line_num) == -1) {
+        if (parse_line_v3(line, ir, line_num) == -1) {
             if (strict_mode) {
                 fprintf(stderr, "Parse error in %s at line %d: %s\n", path, line_num, line);
                 free(line);
                 fclose(f);
-                if (ir->stmts) free(ir->stmts);
+                if (ir->stmts) {
+                    // Free any allocated sub_stmts and arg_indices
+                    for (int i = 0; i < ir->count; i++) {
+                        if (ir->stmts[i].sub_stmts) free(ir->stmts[i].sub_stmts);
+                        if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
+                    }
+                    free(ir->stmts);
+                }
                 free(ir);
                 return NULL;
             }
@@ -728,7 +920,13 @@ static IR* parse_script_file(const char* path) {
         fprintf(stderr, "Error reading %s: getline failed\n", path);
         free(line);
         fclose(f);
-        if (ir->stmts) free(ir->stmts);
+        if (ir->stmts) {
+            for (int i = 0; i < ir->count; i++) {
+                if (ir->stmts[i].sub_stmts) free(ir->stmts[i].sub_stmts);
+                if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
+            }
+            free(ir->stmts);
+        }
         free(ir);
         return NULL;
     }
@@ -750,10 +948,16 @@ static void run_script(const char* path) {
         return;
     }
 
-    executor(ir->stmts, ir->count, env_array);
+    executor_enhanced(ir->stmts, ir->count, env_array);
 
     // Cleanup IR memory
-    if (ir->stmts) free(ir->stmts);
+    if (ir->stmts) {
+        for (int i = 0; i < ir->count; i++) {
+            if (ir->stmts[i].sub_stmts) free(ir->stmts[i].sub_stmts);
+            if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
+        }
+        free(ir->stmts);
+    }
     free(ir);
 }
 
@@ -768,7 +972,7 @@ int main(int argc, char **argv) {
     atexit(cleanup_all);
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N] [--preload|--preload=list:bin1,bin2,...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N] [--preload|--preload=list:bin1,bin2,...] [--strict]\n", argv[0]);
         return 1;
     }
 
@@ -780,28 +984,28 @@ int main(int argc, char **argv) {
 
     // Parse command-line arguments
     for (int i = 1; i < argc; i++) {
-    if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
-        FIXED_VARS = atoi(argv[i] + 13);
-        if (FIXED_VARS <= 0) FIXED_VARS = DEFAULT_FIXED_VARS;
-    } else if (strncmp(argv[i], "--table-size=", 13) == 0) {
-        var_table_size = atoi(argv[i] + 13);
-        if (var_table_size <= 0) {
-            var_table_size = 4096;
-            fprintf(stderr, "Warning: Invalid table-size, using default 4096\n");
-        } else if ((var_table_size & (var_table_size - 1)) != 0) {
-            var_table_size = 1 << (32 - __builtin_clz(var_table_size - 1));
-            fprintf(stderr, "Warning: table-size rounded to power of two: %d\n", var_table_size);
+        if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
+            FIXED_VARS = atoi(argv[i] + 13);
+            if (FIXED_VARS <= 0) FIXED_VARS = DEFAULT_FIXED_VARS;
+        } else if (strncmp(argv[i], "--table-size=", 13) == 0) {
+            var_table_size = atoi(argv[i] + 13);
+            if (var_table_size <= 0) {
+                var_table_size = 4096;
+                fprintf(stderr, "Warning: Invalid table-size, using default 4096\n");
+            } else if ((var_table_size & (var_table_size - 1)) != 0) {
+                var_table_size = 1 << (32 - __builtin_clz(var_table_size - 1));
+                fprintf(stderr, "Warning: table-size rounded to power of two: %d\n", var_table_size);
+            }
+        } else if (strcmp(argv[i], "--preload") == 0) {
+            preload_all = 1;
+        } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
+            preload_list = argv[i] + 15; // skip "list:"
+        } else if (strcmp(argv[i], "--strict") == 0) {
+            strict_mode = 1;
+        } else if (argv[i][0] != '-') {
+            script_path = argv[i];
         }
-    } else if (strcmp(argv[i], "--preload") == 0) {
-        preload_all = 1;
-    } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
-        preload_list = argv[i] + 15; // skip "list:"
-    } else if (strcmp(argv[i], "--strict") == 0) {
-        strict_mode = 1;
-    } else if (argv[i][0] != '-') {
-        script_path = argv[i];
     }
-}
 
     if (!script_path) {
         fprintf(stderr, "Error: no script specified\n");
