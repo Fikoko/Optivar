@@ -47,13 +47,14 @@ For simplicity, it is translated to natural language as:
 
 ## Getting Started
 
-![Community](https://img.shields.io/badge/community-join-blue.svg) ![Contribute](https://img.shields.io/badge/contribute-join-yellow.svg)
+[![Community](https://img.shields.io/badge/Community-Join-blue.svg)](https://github.com/Fikoko/Optivar/discussions) 
+[![Contribute](https://img.shields.io/badge/Contribute-Join-yellow.svg)](https://github.com/Fikoko/Optivar/discussions/category=help-wanted)
 
 Copyright © 2025 Fikret Güney Ersezer. All rights reserved.
 
 See the end of this file for further copyright and license information.
 
-This repository can be used for most recent compiler/debugger.
+This repository can be used for most recent interpreter.
 
 ### Dependencies
 
