@@ -14,7 +14,7 @@ This design allows:
 - Extremely **lightweight and fast execution**  
 - **Scalable orchestration** via plugin like superoptimized .bin files  
 
-Researchers can implement **low-level operations** (like arithmetic, control structures, loops, etc.) using a **minimalist Turing-complete instruction set**, while practitioners only need to define **inputs/outputs** as arguments/variables and orchestrate computations.
+Researchers can implement **low-level operations** (like arithmetic, control structures, loops, etc.) using a **minimalist Turing-complete instruction set**, while practitioners only need to define **inputs/outputs** as **arguments/variables** and orchestrate computations.
 
 ---
 
