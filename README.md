@@ -109,7 +109,7 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
    -- Apply the return() function with the "b" variable and store it at "a" variable
 
 -- actual code:
-step1 = do(
+main = do(
 
  my_lib = include("lib.h", "C://user/libs/");  ,   
  a = read_undec_num();  ,                          
