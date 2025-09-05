@@ -95,10 +95,11 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 
 
 
-* Example of Code
+* Example of Code (HPC mode)
 
 ```
--- add_numbers.optivar: Read two undeclared numbers, add them and return the sum
+-- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
+-- (assuming do.bin, include.bin and lib.bin exists. Also for this case "lib.bin" has other functions mentioned below in single merged bin)
 
 main = do(
 
@@ -109,6 +110,20 @@ main = do(
  a = return(b);                                    
 
 );
+```
+* Example of Code (Dynamic mode)
+
+```
+-- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
+-- (assuming include.bin and lib.bin exists. Also for this case lib.bin has other functions below in single merged bin)
+
+
+ my_lib = include("lib.bin", "C://user/libs/");    
+ a = read_undec_num();                            
+ b = read_undec_num();                           
+ b = add_undec_num(a, b);                        
+ a = return(b);                                    
+
 ```
 
 ## Authors
