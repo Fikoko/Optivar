@@ -53,25 +53,23 @@ Copyright © 2025 Fikret Güney Ersezer. All rights reserved.
 
 See the end of this file for further copyright and license information.
 
-This repository can be used for most recent interpreter.
-
 ### Dependencies
 
 * Regardless of future releases of libraries, the logic behind parsing and debugging will not change. Any dependency issue is related with the library conditions.
 
-### Installing
+### How to build and run the Optivar IR executor
 
-* How to download the parser and debugger:
-  
-```
+```bash
+# Clone the repository
 git clone https://github.com/Fikoko/optivar.git
 cd optivar
-./configure
-make
-make test
-sudo make install
+
+# Compile the single source file
+gcc -O3 -march=native -lz -o optivar optivar.c
+
+# Run a script
+./optivar path/to/your/script.optivar
 ```
-  
 
 ### Historical Context and Novelty
 The concept of a declarative, minimalist language for both high-level users and low-level optimizers has roots in earlier paradigms but hasn’t been combined in this way:
@@ -101,15 +99,6 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum
-
-   -- Below is the following steps.
-   -- Apply the include() function with the "lib.bin", "C://user/libs/" arguments and store it at "my_lib" variable
-   -- Apply the read_undec_num() function and store it at "a" variable
-   -- Apply the read_undec_num() function and store it at "b" variable
-   -- Apply the add_undec_num() function with the "a", "b" arguments and store them at "b" variable
-   -- Apply the return() function with the "b" argument and store it at "a" variable
-
--- actual code:
 main = do(
 
  my_lib = include("lib.bin", "C://user/libs/");  ,   
