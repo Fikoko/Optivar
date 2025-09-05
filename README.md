@@ -102,7 +102,7 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum
    -- Below is the following steps.
-   -- Apply the include( ) function with the "lib.h", "C://user/libs/" variables and store it at "my_lib" variable
+   -- Apply the include() function with the "lib.h", "C://user/libs/" variables and store it at "my_lib" variable
    -- Apply the read_undec_num() function and store it at "a" variable
    -- Apply the read_undec_num() function and store it at "b" variable
    -- Apply the add_undec_num() function with the "a", "b" variables and store them at "b" variable
