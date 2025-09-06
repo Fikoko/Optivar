@@ -46,29 +46,41 @@ typedef struct VarSlot {
     char pad[CACHE_LINE - sizeof(void*) - 2*sizeof(int) - sizeof(long)];
 } VarSlot;
 
+// Forward declarations
+struct BinContext;
+struct IRStmt;
+struct StatementBlock;
+
+// Enhanced statement block structure
+typedef struct StatementBlock {
+    struct IRStmt* stmts;
+    int count;
+    int capacity;
+} StatementBlock;
+
 typedef struct IRStmt {
     int lhs_index;
     void* func_ptr;        // kept for backward compatibility
     int argc;
     int* arg_indices;      // indices into env_array
     int dead;
-    char func_name[MAX_NAME_LEN]; // NEW: store the function name
-    struct IRStmt* sub_stmts; // nested statements
-    int sub_count;            // number of nested statements
-    char pad[CACHE_LINE - 4*sizeof(int) - sizeof(void*) - sizeof(int*) - MAX_NAME_LEN - sizeof(struct IRStmt*) - sizeof(int)];
+    char func_name[MAX_NAME_LEN]; // store the function name
+    
+    // Enhanced nested statement support
+    StatementBlock* arg_blocks;    // Array of statement blocks (one per argument)
+    int* arg_types;                // 0=simple var, 1=nested assignment, 2=statement block
+    
+    char pad[CACHE_LINE - 4*sizeof(int) - sizeof(void*) - sizeof(int*) - MAX_NAME_LEN - 
+             sizeof(StatementBlock*) - sizeof(int*)];
 } IRStmt;
 
 // Add static assertions after type definitions
 static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
 static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 
-// Forward declarations
-struct BinContext;
-struct IRStmt;
-
 // Enhanced bin function signature with context for bin-to-bin calls
 typedef void (*BinFunc)(long* lhs, long* args, 
-                       struct IRStmt* sub_stmts, int sub_count,
+                       StatementBlock* arg_blocks, int argc,
                        struct BinContext* ctx);
 
 // Context passed to bin functions for direct bin-to-bin calls
@@ -482,23 +494,208 @@ static void init_env(int total_vars) {
 }
 
 //
-// Enhanced parser that supports nested statements
+// Enhanced statement block functions
 //
-static int parse_expression(const char* expr, int expr_len, IR* nested_ir);
-
-static int find_matching_paren(const char* str, int start) {
-    int paren_count = 1;
-    int pos = start + 1;
-    while (str[pos] && paren_count > 0) {
-        if (str[pos] == '(') paren_count++;
-        else if (str[pos] == ')') paren_count--;
-        pos++;
-    }
-    return (paren_count == 0) ? pos - 1 : -1;
+static StatementBlock* create_statement_block() {
+    StatementBlock* block = arena_alloc(sizeof(StatementBlock));
+    block->stmts = NULL;
+    block->count = 0;
+    block->capacity = 0;
+    return block;
 }
 
-static int parse_expression(const char* expr, int expr_len, IR* nested_ir) {
-    // Look for assignment pattern: var = func(args)
+static IRStmt* add_stmt_to_block(StatementBlock* block) {
+    if (block->count >= block->capacity) {
+        int new_cap = block->capacity ? block->capacity * 2 : 8;
+        IRStmt* new_stmts = realloc(block->stmts, sizeof(IRStmt) * new_cap);
+        if (!new_stmts) { perror("realloc block stmts"); exit(EXIT_FAILURE); }
+        block->stmts = new_stmts;
+        block->capacity = new_cap;
+    }
+    IRStmt* stmt = &block->stmts[block->count++];
+    memset(stmt, 0, sizeof(IRStmt));
+    return stmt;
+}
+
+//
+// Enhanced parser that supports nested statements and block syntax
+//
+static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir);
+static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt);
+static int parse_argument_block(const char* arg_start, const char* arg_end, StatementBlock* block);
+
+// Helper to find matching delimiter (handles both () and {})
+static int find_matching_delim(const char* str, int start, char open, char close) {
+    int delim_count = 1;
+    int pos = start + 1;
+    while (str[pos] && delim_count > 0) {
+        if (str[pos] == open) delim_count++;
+        else if (str[pos] == close) delim_count--;
+        pos++;
+    }
+    return (delim_count == 0) ? pos - 1 : -1;
+}
+
+// Enhanced argument parsing that handles statement blocks
+static int parse_argument_block(const char* arg_start, const char* arg_end, StatementBlock* block) {
+    const char* stmt_start = arg_start;
+    int paren_depth = 0;
+    int brace_depth = 0;
+    
+    for (const char* p = arg_start; p <= arg_end + 1; p++) {
+        if (p <= arg_end) {
+            if (*p == '(') paren_depth++;
+            else if (*p == ')') paren_depth--;
+            else if (*p == '{') brace_depth++;
+            else if (*p == '}') brace_depth--;
+        }
+        
+        // Statement separator: comma at depth 0, or end of block
+        if ((p > arg_end || (*p == ',' && paren_depth == 0 && brace_depth == 0))) {
+            const char* stmt_end = (p > arg_end) ? arg_end : p - 1;
+            
+            // Trim whitespace
+            while (stmt_start < stmt_end && isspace(*stmt_start)) stmt_start++;
+            while (stmt_end > stmt_start && isspace(*stmt_end)) stmt_end--;
+            
+            if (stmt_start <= stmt_end) {
+                int stmt_len = stmt_end - stmt_start + 1;
+                
+                // Create a temporary IR for this statement
+                IR temp_ir;
+                ir_init(&temp_ir);
+                
+                if (parse_expression_enhanced(stmt_start, stmt_len, &temp_ir) == 0 && temp_ir.count > 0) {
+                    // Add statement to block
+                    IRStmt* block_stmt = add_stmt_to_block(block);
+                    *block_stmt = temp_ir.stmts[0]; // Copy the statement
+                    
+                    // Clean up temporary IR structure (but not the copied content)
+                    if (temp_ir.stmts) free(temp_ir.stmts);
+                }
+            }
+            
+            stmt_start = p + 1;
+        }
+    }
+    
+    return block->count;
+}
+
+// Enhanced argument parsing for mixed simple/nested/block arguments
+static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt) {
+    // Count arguments first
+    int arg_count = 0;
+    int paren_depth = 0;
+    int brace_depth = 0;
+    
+    for (const char* p = args_start; p <= args_end; p++) {
+        if (*p == '(') paren_depth++;
+        else if (*p == ')') paren_depth--;
+        else if (*p == '{') brace_depth++;
+        else if (*p == '}') brace_depth--;
+        else if (*p == ',' && paren_depth == 0 && brace_depth == 0) {
+            arg_count++;
+        }
+    }
+    if (args_start <= args_end) arg_count++;
+    
+    // Allocate arrays
+    stmt->argc = arg_count;
+    stmt->arg_indices = malloc(sizeof(int) * arg_count);
+    stmt->arg_types = malloc(sizeof(int) * arg_count);
+    stmt->arg_blocks = malloc(sizeof(StatementBlock) * arg_count);
+    
+    if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks) {
+        perror("malloc enhanced args");
+        return -1;
+    }
+    
+    // Initialize
+    memset(stmt->arg_blocks, 0, sizeof(StatementBlock) * arg_count);
+    
+    // Parse each argument
+    int current_arg = 0;
+    paren_depth = 0;
+    brace_depth = 0;
+    const char* arg_start = args_start;
+    
+    for (const char* p = args_start; p <= args_end + 1; p++) {
+        if (p <= args_end) {
+            if (*p == '(') paren_depth++;
+            else if (*p == ')') paren_depth--;
+            else if (*p == '{') brace_depth++;
+            else if (*p == '}') brace_depth--;
+        }
+        
+        if ((p > args_end || (*p == ',' && paren_depth == 0 && brace_depth == 0)) && current_arg < arg_count) {
+            const char* arg_end = (p > args_end) ? args_end : p - 1;
+            
+            // Trim whitespace
+            while (arg_start < arg_end && isspace(*arg_start)) arg_start++;
+            while (arg_end > arg_start && isspace(*arg_end)) arg_end--;
+            
+            int arg_len = arg_end - arg_start + 1;
+            
+            // Determine argument type
+            if (strchr(arg_start, '{') && find_matching_delim(arg_start, strchr(arg_start, '{') - arg_start, '{', '}') >= 0) {
+                // Statement block argument
+                stmt->arg_types[current_arg] = 2;
+                stmt->arg_indices[current_arg] = -1;
+                parse_argument_block(arg_start, arg_end, &stmt->arg_blocks[current_arg]);
+            } else {
+                // Check for nested assignment
+                bool has_assignment = false;
+                int temp_paren_depth = 0;
+                for (const char* q = arg_start; q <= arg_end; q++) {
+                    if (*q == '(') temp_paren_depth++;
+                    else if (*q == ')') temp_paren_depth--;
+                    else if (*q == '=' && temp_paren_depth == 0) {
+                        has_assignment = true;
+                        break;
+                    }
+                }
+                
+                if (has_assignment) {
+                    // Nested assignment
+                    stmt->arg_types[current_arg] = 1;
+                    IR nested_ir;
+                    ir_init(&nested_ir);
+                    
+                    if (parse_expression_enhanced(arg_start, arg_len, &nested_ir) == 0 && nested_ir.count > 0) {
+                        stmt->arg_indices[current_arg] = nested_ir.stmts[0].lhs_index;
+                        // Store nested statement in block for execution
+                        StatementBlock* block = &stmt->arg_blocks[current_arg];
+                        block->stmts = malloc(sizeof(IRStmt));
+                        block->count = 1;
+                        block->capacity = 1;
+                        block->stmts[0] = nested_ir.stmts[0];
+                    }
+                    
+                    if (nested_ir.stmts) free(nested_ir.stmts);
+                } else {
+                    // Simple variable
+                    stmt->arg_types[current_arg] = 0;
+                    char simple_var[MAX_NAME_LEN];
+                    if (arg_len < MAX_NAME_LEN) {
+                        strncpy(simple_var, arg_start, arg_len);
+                        simple_var[arg_len] = '\0';
+                        stmt->arg_indices[current_arg] = var_index(simple_var);
+                    }
+                }
+            }
+            
+            current_arg++;
+            arg_start = p + 1;
+        }
+    }
+    
+    return 0;
+}
+
+// Enhanced parse_expression with block support
+static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir) {
+    // Look for assignment pattern: var = func(args) or var = func{block}
     const char* eq = NULL;
     for (int i = 0; i < expr_len; i++) {
         if (expr[i] == '=') {
@@ -523,15 +720,29 @@ static int parse_expression(const char* expr, int expr_len, IR* nested_ir) {
     strncpy(lhs, lhs_start, lhs_len);
     lhs[lhs_len] = '\0';
     
-    // Find function name and arguments
+    // Find function name and arguments/blocks
     const char* rhs = eq + 1;
     while (isspace(*rhs)) rhs++;
     
+    // Look for either parentheses or braces
+    const char* open_delim = NULL;
+    char close_delim = ')';
+    
     const char* paren = strchr(rhs, '(');
-    if (!paren) return -1;
+    const char* brace = strchr(rhs, '{');
+    
+    if (paren && (!brace || paren < brace)) {
+        open_delim = paren;
+        close_delim = ')';
+    } else if (brace) {
+        open_delim = brace;
+        close_delim = '}';
+    }
+    
+    if (!open_delim) return -1;
     
     // Extract function name
-    const char* fname_end = paren - 1;
+    const char* fname_end = open_delim - 1;
     while (fname_end > rhs && isspace(*fname_end)) fname_end--;
     int fname_len = fname_end - rhs + 1;
     if (fname_len <= 0 || fname_len >= MAX_NAME_LEN) return -1;
@@ -540,133 +751,62 @@ static int parse_expression(const char* expr, int expr_len, IR* nested_ir) {
     strncpy(fname, rhs, fname_len);
     fname[fname_len] = '\0';
     
-    // Find matching closing paren
-    int close_paren = find_matching_paren(rhs, paren - rhs);
-    if (close_paren < 0) return -1;
+    // Find matching closing delimiter
+    int close_pos = find_matching_delim(rhs, open_delim - rhs, *open_delim, close_delim);
+    if (close_pos < 0) return -1;
     
-    // Parse arguments (which may be nested statements)
-    const char* args_start = paren + 1;
-    const char* args_end = rhs + close_paren - 1;
+    // Parse arguments/blocks
+    const char* content_start = open_delim + 1;
+    const char* content_end = rhs + close_pos - 1;
     
     // Skip whitespace
-    while (args_start < args_end && isspace(*args_start)) args_start++;
-    while (args_end > args_start && isspace(*args_end)) args_end--;
+    while (content_start < content_end && isspace(*content_start)) content_start++;
+    while (content_end > content_start && isspace(*content_end)) content_end--;
     
     // Create IR statement
     IRStmt* stmt = ir_alloc_stmt(nested_ir);
     stmt->lhs_index = var_index(lhs);
     strncpy(stmt->func_name, fname, MAX_NAME_LEN);
     
-    // Parse arguments - they can be either simple variables or nested expressions
-    if (args_start < args_end) {
-        // Count arguments first
-        int arg_count = 0;
-        int paren_depth = 0;
-        const char* arg_start = args_start;
-        
-        for (const char* p = args_start; p <= args_end; p++) {
-            if (*p == '(') paren_depth++;
-            else if (*p == ')') paren_depth--;
-            else if (*p == ',' && paren_depth == 0) {
-                arg_count++;
-            }
-        }
-        if (arg_start <= args_end) arg_count++; // Last argument
-        
-        // Allocate argument arrays
-        stmt->argc = arg_count;
-        stmt->arg_indices = malloc(sizeof(int) * arg_count);
-        if (!stmt->arg_indices) { perror("malloc arg_indices"); return -1; }
-        
-        // Parse each argument
-        int current_arg = 0;
-        paren_depth = 0;
-        arg_start = args_start;
-        
-        for (const char* p = args_start; p <= args_end + 1; p++) {
-            if (p <= args_end && *p == '(') paren_depth++;
-            else if (p <= args_end && *p == ')') paren_depth--;
-            else if ((p > args_end || (*p == ',' && paren_depth == 0)) && current_arg < arg_count) {
-                // Found end of argument
-                const char* arg_end = (p > args_end) ? args_end : p - 1;
-                
-                // Trim whitespace
-                while (arg_start < arg_end && isspace(*arg_start)) arg_start++;
-                while (arg_end > arg_start && isspace(*arg_end)) arg_end--;
-                
-                int arg_len = arg_end - arg_start + 1;
-                
-                // Check if this argument contains an assignment (nested statement)
-                bool is_nested = false;
-                int nested_paren_depth = 0;
-                for (const char* q = arg_start; q <= arg_end; q++) {
-                    if (*q == '(') nested_paren_depth++;
-                    else if (*q == ')') nested_paren_depth--;
-                    else if (*q == '=' && nested_paren_depth == 0) {
-                        is_nested = true;
-                        break;
-                    }
-                }
-                
-                if (is_nested) {
-                    // Parse as nested expression
-                    IR nested_stmt_ir;
-                    ir_init(&nested_stmt_ir);
-                    
-                    if (parse_expression(arg_start, arg_len, &nested_stmt_ir) == 0 && nested_stmt_ir.count > 0) {
-                        // This is a nested statement - use its LHS as the argument
-                        stmt->arg_indices[current_arg] = nested_stmt_ir.stmts[0].lhs_index;
-                        
-                        // Store nested statements for execution
-                        if (!stmt->sub_stmts) {
-                            stmt->sub_stmts = malloc(sizeof(IRStmt) * 16); // Initial capacity
-                            stmt->sub_count = 0;
-                        }
-                        
-                        // Reallocate if needed (simplified for this example)
-                        stmt->sub_stmts[stmt->sub_count] = nested_stmt_ir.stmts[0];
-                        stmt->sub_count++;
-                    } else {
-                        // Fallback - treat as simple variable
-                        char simple_var[MAX_NAME_LEN];
-                        if (arg_len < MAX_NAME_LEN) {
-                            strncpy(simple_var, arg_start, arg_len);
-                            simple_var[arg_len] = '\0';
-                            stmt->arg_indices[current_arg] = var_index(simple_var);
-                        }
-                    }
-                    
-                    // Clean up temporary IR
-                    if (nested_stmt_ir.stmts) free(nested_stmt_ir.stmts);
-                } else {
-                    // Simple variable argument
-                    char simple_var[MAX_NAME_LEN];
-                    if (arg_len < MAX_NAME_LEN) {
-                        strncpy(simple_var, arg_start, arg_len);
-                        simple_var[arg_len] = '\0';
-                        stmt->arg_indices[current_arg] = var_index(simple_var);
-                    }
-                }
-                
-                current_arg++;
-                arg_start = p + 1; // Start of next argument
-            }
+    if (content_start < content_end) {
+        if (close_delim == '}') {
+            // Block syntax - parse as statement block
+            stmt->argc = 1;
+            stmt->arg_indices = malloc(sizeof(int));
+            stmt->arg_types = malloc(sizeof(int));
+            stmt->arg_blocks = malloc(sizeof(StatementBlock));
+            
+            stmt->arg_indices[0] = -1; // No simple variable
+            stmt->arg_types[0] = 2;    // Statement block
+            
+            StatementBlock* block = &stmt->arg_blocks[0];
+            block->stmts = NULL;
+            block->count = 0;
+            block->capacity = 0;
+            
+            parse_argument_block(content_start, content_end, block);
+        } else {
+            // Parentheses syntax - parse as enhanced arguments
+            parse_enhanced_arguments(content_start, content_end, stmt);
         }
     } else {
         stmt->argc = 0;
         stmt->arg_indices = NULL;
+        stmt->arg_types = NULL;
+        stmt->arg_blocks = NULL;
     }
     
     return 0;
 }
 
+// Enhanced parse_line_v3 function
 static int parse_line_v3(const char* line, IR* ir, int line_num) {
     const char* p = line;
     while (isspace((unsigned char)*p)) ++p;
     if (*p == '\0' || (p[0] == '-' && p[1] == '-')) return 0;  // Empty or comment
 
-    // Find the closing parenthesis of the function call as end marker
-    // Look for assignment pattern first: var = func(args)
+    // Find the closing parenthesis or brace of the function call as end marker
+    // Look for assignment pattern first: var = func(args) or var = func{block}
     const char* eq = strchr(p, '=');
     if (!eq) {
         if (strict_mode) {
@@ -676,35 +816,48 @@ static int parse_line_v3(const char* line, IR* ir, int line_num) {
         return 0; // Skip in non-strict mode
     }
     
-    // Find the opening parenthesis after the '='
+    // Find the opening delimiter after the '='
     const char* open_paren = strchr(eq + 1, '(');
-    if (!open_paren) {
+    const char* open_brace = strchr(eq + 1, '{');
+    
+    const char* open_delim = NULL;
+    char close_delim = ')';
+    
+    if (open_paren && (!open_brace || open_paren < open_brace)) {
+        open_delim = open_paren;
+        close_delim = ')';
+    } else if (open_brace) {
+        open_delim = open_brace;
+        close_delim = '}';
+    }
+    
+    if (!open_delim) {
         if (strict_mode) {
-            fprintf(stderr, "Parse error at line %d: no '(' in function call: %s\n", line_num, line);
+            fprintf(stderr, "Parse error at line %d: no '(' or '{' in function call: %s\n", line_num, line);
             return -1;
         }
         return 0; // Skip in non-strict mode
     }
     
-    // Find matching closing parenthesis
-    int close_paren_pos = find_matching_paren(eq + 1, open_paren - (eq + 1));
-    if (close_paren_pos < 0) {
+    // Find matching closing delimiter
+    int close_delim_pos = find_matching_delim(eq + 1, open_delim - (eq + 1), *open_delim, close_delim);
+    if (close_delim_pos < 0) {
         if (strict_mode) {
-            fprintf(stderr, "Parse error at line %d: unmatched parentheses: %s\n", line_num, line);
+            fprintf(stderr, "Parse error at line %d: unmatched delimiters: %s\n", line_num, line);
             return -1;
         }
         return 0; // Skip in non-strict mode
     }
     
-    // Calculate line length up to and including the closing parenthesis
-    const char* close_paren = eq + 1 + close_paren_pos;
-    int line_len = close_paren - p + 1;
+    // Calculate line length up to and including the closing delimiter
+    const char* close_delim_ptr = eq + 1 + close_delim_pos;
+    int line_len = close_delim_ptr - p + 1;
     
-    return parse_expression(p, line_len, ir);
+    return parse_expression_enhanced(p, line_len, ir);
 }
 
 //
-// Enhanced executor with bin-to-bin support
+// Enhanced executor with bin-to-bin support and statement block execution
 //
 static BinContext global_bin_context;
 static long* args_buffer = NULL;
@@ -729,12 +882,12 @@ void* optivar_get_func(struct BinContext* ctx, const char* name) {
     return NULL;
 }
 
-// Helper function for bin functions to execute nested statements
-void optivar_execute_stmts(struct BinContext* ctx, struct IRStmt* stmts, int count) {
-    if (!ctx || !stmts || count <= 0) return;
+// Helper function to execute a statement block
+static void execute_statement_block(struct BinContext* ctx, StatementBlock* block) {
+    if (!ctx || !block || block->count <= 0) return;
     
-    for (int i = 0; i < count; i++) {
-        IRStmt* stmt = &stmts[i];
+    for (int i = 0; i < block->count; i++) {
+        IRStmt* stmt = &block->stmts[i];
         
         // Resolve function pointer if needed
         if (!stmt->func_ptr && stmt->func_name[0]) {
@@ -759,6 +912,11 @@ void optivar_execute_stmts(struct BinContext* ctx, struct IRStmt* stmts, int cou
         }
         
         for (int j = 0; j < stmt->argc; j++) {
+            if (stmt->arg_types && stmt->arg_types[j] == 2) {
+                // Execute statement block first
+                execute_statement_block(ctx, &stmt->arg_blocks[j]);
+            }
+            
             int idx = stmt->arg_indices[j];
             ctx->temp_buffer[j] = (idx >= 0 && ctx->env[idx]) ? ctx->env[idx]->value : 0;
         }
@@ -771,9 +929,18 @@ void optivar_execute_stmts(struct BinContext* ctx, struct IRStmt* stmts, int cou
         BinFunc fn = (BinFunc)stmt->func_ptr;
         fn(&lhs->value, 
            (stmt->argc > 0) ? ctx->temp_buffer : NULL,
-           stmt->sub_stmts, 
-           stmt->sub_count, 
+           stmt->arg_blocks, 
+           stmt->argc, 
            ctx);
+    }
+}
+
+// Helper function for bin functions to execute nested statements
+void optivar_execute_stmts(struct BinContext* ctx, StatementBlock* blocks, int count) {
+    if (!ctx || !blocks || count <= 0) return;
+    
+    for (int i = 0; i < count; i++) {
+        execute_statement_block(ctx, &blocks[i]);
     }
 }
 
@@ -815,6 +982,16 @@ static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
             continue; // Skip missing functions in non-strict mode
         }
 
+        // Execute nested statement blocks first
+        if (stmt->arg_blocks && stmt->arg_types) {
+            for (int j = 0; j < stmt->argc; j++) {
+                if (stmt->arg_types[j] == 1 || stmt->arg_types[j] == 2) {
+                    // Execute nested assignment or statement block
+                    execute_statement_block(&global_bin_context, &stmt->arg_blocks[j]);
+                }
+            }
+        }
+
         // Prepare arguments
         for (int j = 0; j < stmt->argc; ++j) {
             int idx = stmt->arg_indices[j];
@@ -829,8 +1006,8 @@ static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
         BinFunc fn = (BinFunc)stmt->func_ptr;
         fn(&lhs->value,
            (stmt->argc > 0) ? args_buffer : NULL,
-           stmt->sub_stmts,
-           stmt->sub_count,
+           stmt->arg_blocks,
+           stmt->argc,
            &global_bin_context);
     }
     
@@ -926,9 +1103,17 @@ static IR* parse_script_file(const char* path) {
                 free(line);
                 fclose(f);
                 if (ir->stmts) {
-                    // Free any allocated sub_stmts and arg_indices
+                    // Free any allocated arg_blocks, arg_types and arg_indices
                     for (int i = 0; i < ir->count; i++) {
-                        if (ir->stmts[i].sub_stmts) free(ir->stmts[i].sub_stmts);
+                        if (ir->stmts[i].arg_blocks) {
+                            for (int j = 0; j < ir->stmts[i].argc; j++) {
+                                if (ir->stmts[i].arg_blocks[j].stmts) {
+                                    free(ir->stmts[i].arg_blocks[j].stmts);
+                                }
+                            }
+                            free(ir->stmts[i].arg_blocks);
+                        }
+                        if (ir->stmts[i].arg_types) free(ir->stmts[i].arg_types);
                         if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
                     }
                     free(ir->stmts);
@@ -946,7 +1131,15 @@ static IR* parse_script_file(const char* path) {
         fclose(f);
         if (ir->stmts) {
             for (int i = 0; i < ir->count; i++) {
-                if (ir->stmts[i].sub_stmts) free(ir->stmts[i].sub_stmts);
+                if (ir->stmts[i].arg_blocks) {
+                    for (int j = 0; j < ir->stmts[i].argc; j++) {
+                        if (ir->stmts[i].arg_blocks[j].stmts) {
+                            free(ir->stmts[i].arg_blocks[j].stmts);
+                        }
+                    }
+                    free(ir->stmts[i].arg_blocks);
+                }
+                if (ir->stmts[i].arg_types) free(ir->stmts[i].arg_types);
                 if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
             }
             free(ir->stmts);
@@ -977,7 +1170,15 @@ static void run_script(const char* path) {
     // Cleanup IR memory
     if (ir->stmts) {
         for (int i = 0; i < ir->count; i++) {
-            if (ir->stmts[i].sub_stmts) free(ir->stmts[i].sub_stmts);
+            if (ir->stmts[i].arg_blocks) {
+                for (int j = 0; j < ir->stmts[i].argc; j++) {
+                    if (ir->stmts[i].arg_blocks[j].stmts) {
+                        free(ir->stmts[i].arg_blocks[j].stmts);
+                    }
+                }
+                free(ir->stmts[i].arg_blocks);
+            }
+            if (ir->stmts[i].arg_types) free(ir->stmts[i].arg_types);
             if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
         }
         free(ir->stmts);
