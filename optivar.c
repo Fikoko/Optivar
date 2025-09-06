@@ -1,3 +1,4 @@
+```c
 // optivar.c -- superoptimized, memory-safe, minimal, scalable IR executor
 // Build: gcc -O3 -march=native -lz -o optivar optivar.c
 
@@ -22,7 +23,6 @@
 //
 #define DEFAULT_FIXED_VARS 4096
 #define VAR_CHUNK_SIZE 8192
-#define FIXED_ARG_POOL 8
 #define MAX_NAME_LEN 128
 #define CACHE_LINE 64
 #define MIN_BIN_SIZE 16
@@ -39,7 +39,7 @@ static int strict_mode = 0;  // 0 = skip missing functions, 1 = stop
 // Basic types
 //
 typedef struct VarSlot {
-    void* data;     // either pointer payload or strdup'd name
+    void* data;     // pointer to result (string, number, etc.) or strdup'd name
     int in_use;
     int last_use;
     long value;     // numeric value if needed
@@ -55,30 +55,24 @@ typedef struct IRStmt {
     int lhs_index;
     void* func_ptr;        // kept for backward compatibility
     int argc;
-    int* arg_indices;      // indices into env_array for variables
+    void** args;           // Universal arguments (variables, literals, blocks, nested stmts)
     int dead;
     char func_name[MAX_NAME_LEN]; // store the function name
-    struct StatementBlock* arg_blocks;    // Array of statement blocks (one per argument)
-    int* arg_types;        // 0=variable, 1=nested assignment, 2=statement block, 3=literal
-    void** arg_literals;   // Literal values (numeric or string) as void* (for arg_types == 3)
-    char pad[CACHE_LINE - 4*sizeof(int) - sizeof(void*) - sizeof(int*) - MAX_NAME_LEN - 
-             sizeof(struct StatementBlock*) - sizeof(int*) - sizeof(void**)];
+    char pad[CACHE_LINE - 3*sizeof(int) - sizeof(void*) - sizeof(void**) - MAX_NAME_LEN];
 } IRStmt;
 
 // Add static assertions after type definitions
 static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
 static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 
-// Enhanced bin function signature with context for bin-to-bin calls
-typedef void (*BinFunc)(long* lhs, long* args, struct StatementBlock* arg_blocks, void** arg_literals, int argc, struct BinContext* ctx);
+// Enhanced bin function signature with universal type
+typedef void* (*BinFunc)(void** args, int argc, struct BinContext* ctx);
 
-// Context passed to bin functions for direct bin-to-bin calls
+// Context passed to bin functions
 typedef struct BinContext {
     VarSlot** env;           // Full environment access
     struct FuncEntry* func_table;   // For bin-to-bin calls
     int func_count;
-    long* temp_buffer;       // Temporary buffer for numeric arguments
-    size_t temp_buffer_size;
 } BinContext;
 
 typedef struct IR {
@@ -157,7 +151,7 @@ static size_t arena_used = 0;
 void* arena_alloc_v2(size_t size) {
     if (arena_used + size > arena_size) {
         size_t new_size = arena_size ? arena_size * 2 : ARENA_DEFAULT_SIZE;
-        if (new_size < arena_used + size) 
+        if (new_size < arena_used + size)
             new_size = arena_used + size + ((arena_used + size) / 2);
         char *new_ptr = realloc(arena_ptr, new_size);
         if (!new_ptr) {
@@ -261,37 +255,37 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
     char path[512];
     snprintf(path, sizeof(path), "./funcs/%s.bin", name);
     struct stat st;
-    if (stat(path, &st) != 0) { 
+    if (stat(path, &st) != 0) {
         if (!strict_mode) return NULL;
-        fprintf(stderr, "Error: %s not found\n", path); 
-        return NULL; 
+        fprintf(stderr, "Error: %s not found\n", path);
+        return NULL;
     }
-    if (st.st_size < sizeof(BinHeader) + MIN_BIN_SIZE) { 
-        fprintf(stderr, "Error: %s too small\n", path); 
-        return NULL; 
+    if (st.st_size < sizeof(BinHeader) + MIN_BIN_SIZE) {
+        fprintf(stderr, "Error: %s too small\n", path);
+        return NULL;
     }
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open bin"); return NULL; }
     BinHeader hdr;
-    if (read(fd, &hdr, sizeof(BinHeader)) != (ssize_t)sizeof(BinHeader)) { 
-        perror("read header"); 
-        close(fd); 
-        return NULL; 
+    if (read(fd, &hdr, sizeof(BinHeader)) != (ssize_t)sizeof(BinHeader)) {
+        perror("read header");
+        close(fd);
+        return NULL;
     }
-    if (hdr.magic != BIN_MAGIC) { 
-        fprintf(stderr, "Error: bad magic in %s\n", path); 
-        close(fd); 
-        return NULL; 
+    if (hdr.magic != BIN_MAGIC) {
+        fprintf(stderr, "Error: bad magic in %s\n", path);
+        close(fd);
+        return NULL;
     }
     size_t code_size = st.st_size - sizeof(BinHeader);
     void* mapped = mmap(NULL, code_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, sizeof(BinHeader));
     if (mapped == MAP_FAILED) { perror("mmap"); close(fd); return NULL; }
     uint32_t crc = crc32(0, (unsigned char*)mapped, code_size);
-    if (crc != hdr.code_crc) { 
-        fprintf(stderr, "CRC mismatch %s\n", path); 
-        munmap(mapped, code_size); 
-        close(fd); 
-        return NULL; 
+    if (crc != hdr.code_crc) {
+        fprintf(stderr, "CRC mismatch %s\n", path);
+        munmap(mapped, code_size);
+        close(fd);
+        return NULL;
     }
     close(fd);
     *arg_count_out = hdr.arg_count;
@@ -445,8 +439,9 @@ static void init_env(int total_vars) {
 }
 
 //
-// Enhanced parser that supports nested statements, block syntax, and literals
+// Enhanced parser with universal type
 //
+static int parse_line_v3(const char* line, IR* ir, int line_num);
 static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir);
 static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt);
 static int parse_argument_block(const char* arg_start, const char* arg_end, StatementBlock* block);
@@ -474,7 +469,7 @@ static bool is_numeric_literal(const char* str, int len) {
     return true;
 }
 
-// Enhanced argument parsing for mixed simple/nested/block/literal arguments
+// Enhanced argument parsing for universal type
 static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt) {
     // Count arguments by top-level commas
     int arg_count = 0;
@@ -486,29 +481,14 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
     }
     if (args_start <= args_end) arg_count++;
 
-    // Allocate arrays
+    // Allocate args array
     stmt->argc = arg_count;
-    stmt->arg_indices = malloc(sizeof(int) * arg_count);
-    stmt->arg_types = malloc(sizeof(int) * arg_count);
-    stmt->arg_blocks = malloc(sizeof(StatementBlock) * arg_count);
-    stmt->arg_literals = malloc(sizeof(void*) * arg_count);
-    if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks || !stmt->arg_literals) {
-        perror("malloc enhanced args");
-        free(stmt->arg_indices);
-        free(stmt->arg_types);
-        free(stmt->arg_blocks);
-        free(stmt->arg_literals);
+    stmt->args = malloc(sizeof(void*) * arg_count);
+    if (!stmt->args) {
+        perror("malloc args");
         return -1;
     }
-    // Initialize blocks and literals
-    for (int i = 0; i < arg_count; ++i) {
-        stmt->arg_blocks[i].stmts = NULL;
-        stmt->arg_blocks[i].count = 0;
-        stmt->arg_blocks[i].capacity = 0;
-        stmt->arg_literals[i] = NULL;
-        stmt->arg_indices[i] = -1;
-        stmt->arg_types[i] = 0;
-    }
+    memset(stmt->args, 0, sizeof(void*) * arg_count);
 
     // Parse each argument
     int current_arg = 0;
@@ -526,10 +506,9 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
             int arg_len = (arg_end >= arg_start) ? (int)(arg_end - arg_start + 1) : 0;
 
             if (arg_len <= 0) {
-                stmt->arg_types[current_arg] = 0;
-                stmt->arg_indices[current_arg] = -1;
+                stmt->args[current_arg] = NULL;
             } else {
-                // Check for nested assignment
+                // Check for nested assignment or block
                 bool has_assignment = false;
                 int td = 0;
                 for (const char* q = arg_start; q <= arg_end; ++q) {
@@ -537,59 +516,49 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
                     else if (*q == ')') td--;
                     else if (*q == '=' && td == 0) { has_assignment = true; break; }
                 }
+                bool is_block = (arg_len >= 2 && arg_start[0] == '{' && arg_end[0] == '}');
 
                 if (has_assignment) {
                     // Nested assignment
-                    stmt->arg_types[current_arg] = 1;
                     IR nested_ir;
                     ir_init(&nested_ir);
                     if (parse_expression_enhanced(arg_start, arg_len, &nested_ir) == 0 && nested_ir.count > 0) {
-                        stmt->arg_indices[current_arg] = nested_ir.stmts[0].lhs_index;
-                        StatementBlock* block = &stmt->arg_blocks[current_arg];
-                        block->stmts = malloc(sizeof(IRStmt));
-                        if (!block->stmts) { 
-                            perror("malloc block stmt"); 
-                            free(nested_ir.stmts);
-                            free(stmt->arg_indices);
-                            free(stmt->arg_types);
-                            free(stmt->arg_blocks);
-                            free(stmt->arg_literals);
-                            return -1; 
-                        }
-                        block->capacity = 1;
-                        block->count = 1;
-                        block->stmts[0] = nested_ir.stmts[0];
+                        IRStmt* nested_stmt = arena_alloc_v2(sizeof(IRStmt));
+                        *nested_stmt = nested_ir.stmts[0];
+                        stmt->args[current_arg] = nested_stmt;
                     } else {
-                        stmt->arg_indices[current_arg] = -1;
                         free(nested_ir.stmts);
-                        free(stmt->arg_indices);
-                        free(stmt->arg_types);
-                        free(stmt->arg_blocks);
-                        free(stmt->arg_literals);
+                        stmt->args[current_arg] = NULL;
                         return -1;
                     }
                     free(nested_ir.stmts);
+                } else if (is_block) {
+                    // Statement block
+                    StatementBlock* block = arena_alloc_v2(sizeof(StatementBlock));
+                    block->stmts = NULL;
+                    block->count = 0;
+                    block->capacity = 0;
+                    if (parse_argument_block(arg_start + 1, arg_end - 1, block) != 0) {
+                        stmt->args[current_arg] = NULL;
+                        return -1;
+                    }
+                    stmt->args[current_arg] = block;
                 } else if (arg_len >= 2 && arg_start[0] == '"' && arg_end[0] == '"') {
                     // String literal
-                    stmt->arg_types[current_arg] = 3; // Literal
                     char* literal = arena_alloc_v2(arg_len - 1);
                     strncpy(literal, arg_start + 1, arg_len - 2);
                     literal[arg_len - 2] = '\0';
-                    stmt->arg_literals[current_arg] = literal;
-                    stmt->arg_indices[current_arg] = -1;
+                    stmt->args[current_arg] = literal;
                 } else if (is_numeric_literal(arg_start, arg_len)) {
                     // Numeric literal
-                    stmt->arg_types[current_arg] = 3; // Literal
                     char temp[arg_len + 1];
                     strncpy(temp, arg_start, arg_len);
                     temp[arg_len] = '\0';
                     long* num = arena_alloc_v2(sizeof(long));
                     *num = atol(temp);
-                    stmt->arg_literals[current_arg] = num;
-                    stmt->arg_indices[current_arg] = -1;
+                    stmt->args[current_arg] = num;
                 } else {
                     // Variable
-                    stmt->arg_types[current_arg] = 0;
                     char simple_var[MAX_NAME_LEN];
                     if (arg_len < MAX_NAME_LEN) {
                         strncpy(simple_var, arg_start, arg_len);
@@ -597,9 +566,10 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
                         char *s = simple_var;
                         while (*s && isspace((unsigned char)*s)) s++;
                         if (s != simple_var) memmove(simple_var, s, strlen(s) + 1);
-                        stmt->arg_indices[current_arg] = var_index(simple_var);
+                        int idx = var_index(simple_var);
+                        stmt->args[current_arg] = env_array[idx];
                     } else {
-                        stmt->arg_indices[current_arg] = -1;
+                        stmt->args[current_arg] = NULL;
                     }
                 }
             }
@@ -610,7 +580,7 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
     return 0;
 }
 
-// Enhanced parse_expression with block support
+// Enhanced parse_expression with universal type
 static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir) {
     const char* eq = NULL;
     for (int i = 0; i < expr_len; i++) {
@@ -634,7 +604,7 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
     while (isspace(*rhs)) rhs++;
     const char* open_delim = strchr(rhs, '(');
     if (!open_delim) return -1;
-    char close_delim = ')';
+    char close_delim = (open_delim[-1] == '{') ? '}' : ')';
     const char* fname_end = open_delim - 1;
     while (fname_end > rhs && isspace(*fname_end)) fname_end--;
     int fname_len = fname_end - rhs + 1;
@@ -652,45 +622,12 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
     stmt->lhs_index = var_index(lhs);
     strncpy(stmt->func_name, fname, MAX_NAME_LEN);
     if (content_start < content_end) {
-        if (close_delim == '}') {
-            stmt->argc = 1;
-            stmt->arg_indices = malloc(sizeof(int));
-            stmt->arg_types = malloc(sizeof(int));
-            stmt->arg_blocks = malloc(sizeof(StatementBlock));
-            stmt->arg_literals = malloc(sizeof(void*));
-            if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks || !stmt->arg_literals) {
-                perror("malloc block args");
-                free(stmt->arg_indices);
-                free(stmt->arg_types);
-                free(stmt->arg_blocks);
-                free(stmt->arg_literals);
-                return -1;
-            }
-            stmt->arg_indices[0] = -1;
-            stmt->arg_types[0] = 2;
-            stmt->arg_literals[0] = NULL;
-            StatementBlock* block = &stmt->arg_blocks[0];
-            block->stmts = NULL;
-            block->count = 0;
-            block->capacity = 0;
-            if (parse_argument_block(content_start, content_end, block) != 0) {
-                free(stmt->arg_indices);
-                free(stmt->arg_types);
-                free(stmt->arg_blocks);
-                free(stmt->arg_literals);
-                return -1;
-            }
-        } else {
-            if (parse_enhanced_arguments(content_start, content_end, stmt) != 0) {
-                return -1;
-            }
+        if (parse_enhanced_arguments(content_start, content_end, stmt) != 0) {
+            return -1;
         }
     } else {
         stmt->argc = 0;
-        stmt->arg_indices = NULL;
-        stmt->arg_types = NULL;
-        stmt->arg_blocks = NULL;
-        stmt->arg_literals = NULL;
+        stmt->args = NULL;
     }
     return 0;
 }
@@ -724,30 +661,28 @@ static int parse_argument_block(const char* arg_start, const char* arg_end, Stat
     return 0;
 }
 
-// Enhanced executor with bin-to-bin support and literal support
-static BinContext global_bin_context;
-static long* args_buffer = NULL;
-static size_t args_buffer_size = 0;
-
-void* optivar_get_func(struct BinContext* ctx, const char* name) {
-    if (!ctx || !ctx->func_table) return NULL;
-    for (int i = 0; i < ctx->func_count; i++) {
-        if (strcmp(ctx->func_table[i].name, name) == 0) {
-            if (!ctx->func_table[i].ptr) {
-                int arg_count;
-                size_t len;
-                ctx->func_table[i].ptr = load_binfunc(name, &arg_count, &len);
-                ctx->func_table[i].arg_count = arg_count;
-                ctx->func_table[i].len = len;
-            }
-            return ctx->func_table[i].ptr;
+// Parse line with universal type
+static int parse_line_v3(const char* line, IR* ir, int line_num) {
+    int len = strlen(line);
+    while (len > 0 && isspace((unsigned char)line[len-1])) len--;
+    if (len <= 0) return 0;
+    if (line[0] == '-' && line[1] == '-') return 0; // Skip comments
+    if (parse_expression_enhanced(line, len, ir) != 0) {
+        if (strict_mode) {
+            fprintf(stderr, "Parse error at line %d: %s\n", line_num, line);
+            return -1;
         }
+        return 0;
     }
-    return NULL;
+    return 0;
 }
 
-static void execute_statement_block(struct BinContext* ctx, StatementBlock* block) {
-    if (!ctx || !block || block->count <= 0) return;
+// Enhanced executor with universal type
+static BinContext global_bin_context;
+
+static void* execute_statement_block(struct BinContext* ctx, StatementBlock* block) {
+    if (!ctx || !block || block->count <= 0) return NULL;
+    void* last_result = NULL;
     for (int i = 0; i < block->count; i++) {
         IRStmt* stmt = &block->stmts[i];
         if (!stmt->func_ptr && stmt->func_name[0]) {
@@ -762,32 +697,34 @@ static void execute_statement_block(struct BinContext* ctx, StatementBlock* bloc
             }
             continue;
         }
-        if ((size_t)stmt->argc > ctx->temp_buffer_size) {
-            ctx->temp_buffer_size = stmt->argc * 2;
-            ctx->temp_buffer = realloc(ctx->temp_buffer, sizeof(long) * ctx->temp_buffer_size);
-            if (!ctx->temp_buffer) { perror("realloc temp_buffer"); exit(EXIT_FAILURE); }
-        }
+        // Prepare arguments
+        void** args = stmt->args;
         for (int j = 0; j < stmt->argc; j++) {
-            if (stmt->arg_types && stmt->arg_types[j] == 2) {
-                execute_statement_block(ctx, &stmt->arg_blocks[j]);
-            }
-            if (stmt->arg_types && stmt->arg_types[j] == 3) {
-                ctx->temp_buffer[j] = stmt->arg_literals[j] ? *(long*)stmt->arg_literals[j] : 0;
-            } else {
-                int idx = stmt->arg_indices[j];
-                ctx->temp_buffer[j] = (idx >= 0 && ctx->env[idx]) ? ctx->env[idx]->value : 0;
+            if (args[j] && ((IRStmt*)args[j])->lhs_index >= 0) {
+                // Nested assignment
+                IRStmt* nested = (IRStmt*)args[j];
+                args[j] = execute_statement_block(ctx, &(StatementBlock){
+                    .stmts = nested,
+                    .count = 1,
+                    .capacity = 1
+                });
+            } else if (args[j] && ((StatementBlock*)args[j])->stmts) {
+                // Statement block
+                args[j] = execute_statement_block(ctx, (StatementBlock*)args[j]);
             }
         }
         VarSlot* lhs = (stmt->lhs_index >= 0) ? ctx->env[stmt->lhs_index] : NULL;
-        if (!lhs) continue;
         BinFunc fn = (BinFunc)stmt->func_ptr;
-        fn(&lhs->value, 
-           (stmt->argc > 0) ? ctx->temp_buffer : NULL,
-           stmt->arg_blocks, 
-           stmt->arg_literals, 
-           stmt->argc, 
-           ctx);
+        void* result = fn(args, stmt->argc, ctx);
+        if (lhs && result) {
+            lhs->data = result;
+            if (result && is_numeric_literal((char*)result, strlen((char*)result))) {
+                lhs->value = *(long*)result;
+            }
+        }
+        last_result = result;
     }
+    return last_result;
 }
 
 static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
@@ -795,13 +732,6 @@ static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
     global_bin_context.env = env;
     global_bin_context.func_table = func_table;
     global_bin_context.func_count = func_count;
-    global_bin_context.temp_buffer = NULL;
-    global_bin_context.temp_buffer_size = 0;
-    if ((size_t)stmt_count * 16 > args_buffer_size) {
-        args_buffer_size = stmt_count * 16;
-        args_buffer = realloc(args_buffer, sizeof(long) * args_buffer_size);
-        if (!args_buffer) { perror("realloc args_buffer"); exit(EXIT_FAILURE); }
-    }
     for (int i = 0; i < stmt_count; ++i) {
         IRStmt* stmt = &stmts[i];
         if (stmt->dead || stmt->lhs_index < 0) continue;
@@ -817,31 +747,32 @@ static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
             }
             continue;
         }
-        for (int j = 0; j < stmt->argc; ++j) {
-            if (stmt->arg_types[j] == 2) {
-                execute_statement_block(&global_bin_context, &stmt->arg_blocks[j]);
-            }
-            if (stmt->arg_types[j] == 3) {
-                args_buffer[j] = stmt->arg_literals[j] ? *(long*)stmt->arg_literals[j] : 0;
-            } else {
-                int idx = stmt->arg_indices[j];
-                args_buffer[j] = (idx >= 0 && env[idx]) ? env[idx]->value : 0;
+        // Prepare arguments
+        void** args = stmt->args;
+        for (int j = 0; j < stmt->argc; j++) {
+            if (args[j] && ((IRStmt*)args[j])->lhs_index >= 0) {
+                // Nested assignment
+                IRStmt* nested = (IRStmt*)args[j];
+                args[j] = execute_statement_block(&global_bin_context, &(StatementBlock){
+                    .stmts = nested,
+                    .count = 1,
+                    .capacity = 1
+                });
+            } else if (args[j] && ((StatementBlock*)args[j])->stmts) {
+                // Statement block
+                args[j] = execute_statement_block(&global_bin_context, (StatementBlock*)args[j]);
             }
         }
         VarSlot* lhs = env[stmt->lhs_index];
         if (!lhs) continue;
         BinFunc fn = (BinFunc)stmt->func_ptr;
-        fn(&lhs->value,
-           (stmt->argc > 0) ? args_buffer : NULL,
-           stmt->arg_blocks,
-           stmt->arg_literals,
-           stmt->argc,
-           &global_bin_context);
-    }
-    if (global_bin_context.temp_buffer) {
-        free(global_bin_context.temp_buffer);
-        global_bin_context.temp_buffer = NULL;
-        global_bin_context.temp_buffer_size = 0;
+        void* result = fn(args, stmt->argc, &global_bin_context);
+        if (result) {
+            lhs->data = result;
+            if (result && is_numeric_literal((char*)result, strlen((char*)result))) {
+                lhs->value = *(long*)result;
+            }
+        }
     }
 }
 
@@ -879,11 +810,6 @@ static void cleanup_all() {
         func_table = NULL;
     }
     arena_free();
-    if (args_buffer) {
-        free(args_buffer);
-        args_buffer = NULL;
-        args_buffer_size = 0;
-    }
 }
 
 static char* read_block(FILE* f, int *out_lines_read) {
@@ -953,17 +879,7 @@ static IR* parse_script_file(const char* path) {
                 fclose(f);
                 if (ir->stmts) {
                     for (int i = 0; i < ir->count; i++) {
-                        if (ir->stmts[i].arg_blocks) {
-                            for (int j = 0; j < ir->stmts[i].argc; j++) {
-                                if (ir->stmts[i].arg_blocks[j].stmts) {
-                                    free(ir->stmts[i].arg_blocks[j].stmts);
-                                }
-                            }
-                            free(ir->stmts[i].arg_blocks);
-                        }
-                        if (ir->stmts[i].arg_types) free(ir->stmts[i].arg_types);
-                        if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
-                        if (ir->stmts[i].arg_literals) free(ir->stmts[i].arg_literals);
+                        if (ir->stmts[i].args) free(ir->stmts[i].args);
                     }
                     free(ir->stmts);
                 }
@@ -993,17 +909,14 @@ static void run_script(const char* path) {
     executor_enhanced(ir->stmts, ir->count, env_array);
     if (ir->stmts) {
         for (int i = 0; i < ir->count; i++) {
-            if (ir->stmts[i].arg_blocks) {
+            if (ir->stmts[i].args) {
                 for (int j = 0; j < ir->stmts[i].argc; j++) {
-                    if (ir->stmts[i].arg_blocks[j].stmts) {
-                        free(ir->stmts[i].arg_blocks[j].stmts);
+                    if (ir->stmts[i].args[j] && ((StatementBlock*)ir->stmts[i].args[j])->stmts) {
+                        free(((StatementBlock*)ir->stmts[i].args[j])->stmts);
                     }
                 }
-                free(ir->stmts[i].arg_blocks);
+                free(ir->stmts[i].args);
             }
-            if (ir->stmts[i].arg_types) free(ir->stmts[i].arg_types);
-            if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
-            if (ir->stmts[i].arg_literals) free(ir->stmts[i].arg_literals);
         }
         free(ir->stmts);
     }
@@ -1084,3 +997,4 @@ int main(int argc, char **argv) {
     run_script(script_path);
     return 0;
 }
+```
