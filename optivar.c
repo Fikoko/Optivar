@@ -878,8 +878,11 @@ static IR* parse_script_file(const char* path) {
                 free(block);
                 fclose(f);
                 if (ir->stmts) {
+                    // FIX: Add this loop to free the allocated argument arrays
                     for (int i = 0; i < ir->count; i++) {
-                        if (ir->stmts[i].args) free(ir->stmts[i].args);
+                        if (ir->stmts[i].args) {
+                            free(ir->stmts[i].args);
+                        }
                     }
                     free(ir->stmts);
                 }
@@ -887,6 +890,7 @@ static IR* parse_script_file(const char* path) {
                 return NULL;
             }
         }
+        
         line_num += consumed;
         free(block);
     }
