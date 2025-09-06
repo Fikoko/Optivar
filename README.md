@@ -33,7 +33,7 @@ Researchers can implement **low-level operations** (like arithmetic, control str
 
 1. **Function call**
 ```
-output = f(input1, input2, input3, ...);
+output = f(input1, input2, input3, ...)
 ```
 
 2. **Function call** 
@@ -103,13 +103,13 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 
 main = do(
 
- my_lib = include("lib.bin", "C://user/libs/");  ,   
- a = read_undec_num();  ,                          
- b = read_undec_num();  ,                          
- b = add_undec_num(a, b);  ,                       
- a = return(b);                                    
+ my_lib = include("lib.bin", "C://user/libs/")  ,   
+ a = read_undec_num()  ,                          
+ b = read_undec_num()  ,                          
+ b = add_undec_num(a, b)  ,                       
+ a = return(b)                                   
 
-);
+)
 ```
 * Example of Code (Dynamic mode)
 
@@ -118,11 +118,11 @@ main = do(
 -- (assuming include.bin and lib.bin exists. Also for this case lib.bin has other functions below in single merged bin)
 
 
- my_lib = include("lib.bin", "C://user/libs/");    
- a = read_undec_num();                            
- b = read_undec_num();                           
- b = add_undec_num(a, b);                        
- a = return(b);                                    
+ my_lib = include("lib.bin", "C://user/libs/")    
+ a = read_undec_num()                            
+ b = read_undec_num()                          
+ b = add_undec_num(a, b)                       
+ a = return(b)                                  
 
 ```
 
