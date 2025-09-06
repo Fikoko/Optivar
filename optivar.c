@@ -55,16 +55,14 @@ typedef struct IRStmt {
     int lhs_index;
     void* func_ptr;        // kept for backward compatibility
     int argc;
-    int* arg_indices;      // indices into env_array
+    int* arg_indices;      // indices into env_array for variables
     int dead;
     char func_name[MAX_NAME_LEN]; // store the function name
-    
-    // Enhanced nested statement support
     struct StatementBlock* arg_blocks;    // Array of statement blocks (one per argument)
-    int* arg_types;                // 0=simple var, 1=nested assignment, 2=statement block
-    
+    int* arg_types;        // 0=variable, 1=nested assignment, 2=statement block, 3=literal
+    void** arg_literals;   // Literal values (numeric or string) as void* (for arg_types == 3)
     char pad[CACHE_LINE - 4*sizeof(int) - sizeof(void*) - sizeof(int*) - MAX_NAME_LEN - 
-             sizeof(struct StatementBlock*) - sizeof(int*)];
+             sizeof(struct StatementBlock*) - sizeof(int*) - sizeof(void**)];
 } IRStmt;
 
 // Add static assertions after type definitions
@@ -72,16 +70,14 @@ static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
 static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 
 // Enhanced bin function signature with context for bin-to-bin calls
-typedef void (*BinFunc)(long* lhs, long* args, 
-                       struct StatementBlock* arg_blocks, int argc,
-                       struct BinContext* ctx);
+typedef void (*BinFunc)(long* lhs, long* args, struct StatementBlock* arg_blocks, void** arg_literals, int argc, struct BinContext* ctx);
 
 // Context passed to bin functions for direct bin-to-bin calls
 typedef struct BinContext {
     VarSlot** env;           // Full environment access
     struct FuncEntry* func_table;   // For bin-to-bin calls
     int func_count;
-    long* temp_buffer;       // Temporary buffer for arguments
+    long* temp_buffer;       // Temporary buffer for numeric arguments
     size_t temp_buffer_size;
 } BinContext;
 
@@ -160,11 +156,9 @@ static size_t arena_used = 0;
 
 void* arena_alloc_v2(size_t size) {
     if (arena_used + size > arena_size) {
-        // Grow arena exponentially
-        size_t new_size = arena_size * 2;
+        size_t new_size = arena_size ? arena_size * 2 : ARENA_DEFAULT_SIZE;
         if (new_size < arena_used + size) 
             new_size = arena_used + size + ((arena_used + size) / 2);
-
         char *new_ptr = realloc(arena_ptr, new_size);
         if (!new_ptr) {
             perror("arena realloc failed");
@@ -178,13 +172,10 @@ void* arena_alloc_v2(size_t size) {
     return ptr;
 }
 
-
-// reset arena (does not free buffer, just resets usage)
 static void arena_reset() {
     arena_used = 0;
 }
 
-// free arena completely
 static void arena_free() {
     if (arena_ptr) free(arena_ptr);
     arena_ptr = NULL;
@@ -196,7 +187,6 @@ static void arena_free() {
 // Pool allocator for VarSlot
 //
 static VarSlot* pool_alloc() {
-    // try fixed pool quickly (no lock; these are global but only allocated at init/parse time
     for (int i = 0; i < fixed_top; ++i) {
         if (!fixed_pool[i].in_use) {
             fixed_pool[i].in_use = 1;
@@ -214,7 +204,6 @@ static VarSlot* pool_alloc() {
         s->value = 0;
         return s;
     }
-    // search dynamic chunks
     VarPoolChunk* c = dynamic_pool;
     while (c) {
         for (int i = 0; i < c->capacity; ++i) {
@@ -228,9 +217,8 @@ static VarSlot* pool_alloc() {
         }
         c = c->next;
     }
-    // create new chunk from thread arena (fast)
     int cap = VAR_CHUNK_SIZE;
-    VarPoolChunk* nc = arena_alloc(sizeof(VarPoolChunk));
+    VarPoolChunk* nc = arena_alloc_v2(sizeof(VarPoolChunk));
     nc->slots = aligned_alloc(CACHE_LINE, cap * sizeof(VarSlot));
     if (!nc->slots) { perror("aligned_alloc slots"); exit(EXIT_FAILURE); }
     nc->capacity = cap;
@@ -274,21 +262,16 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
     snprintf(path, sizeof(path), "./funcs/%s.bin", name);
     struct stat st;
     if (stat(path, &st) != 0) { 
-        if (!strict_mode) {
-            return NULL;  // Silently return NULL in non-strict mode
-        }
+        if (!strict_mode) return NULL;
         fprintf(stderr, "Error: %s not found\n", path); 
         return NULL; 
     }
-
     if (st.st_size < sizeof(BinHeader) + MIN_BIN_SIZE) { 
         fprintf(stderr, "Error: %s too small\n", path); 
         return NULL; 
     }
-
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open bin"); return NULL; }
-
     BinHeader hdr;
     if (read(fd, &hdr, sizeof(BinHeader)) != (ssize_t)sizeof(BinHeader)) { 
         perror("read header"); 
@@ -300,12 +283,9 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
         close(fd); 
         return NULL; 
     }
-
     size_t code_size = st.st_size - sizeof(BinHeader);
     void* mapped = mmap(NULL, code_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, sizeof(BinHeader));
     if (mapped == MAP_FAILED) { perror("mmap"); close(fd); return NULL; }
-
-    // CRC check in-place
     uint32_t crc = crc32(0, (unsigned char*)mapped, code_size);
     if (crc != hdr.code_crc) { 
         fprintf(stderr, "CRC mismatch %s\n", path); 
@@ -313,7 +293,6 @@ static void* load_binfunc(const char* name, int* arg_count_out, size_t* len_out)
         close(fd); 
         return NULL; 
     }
-
     close(fd);
     *arg_count_out = hdr.arg_count;
     *len_out = code_size;
@@ -351,14 +330,12 @@ static void preload_binfuncs(const char* dirpath) {
 
 static void* get_func_ptr(const char* name, int* arg_count_out, size_t* len_out) {
     if (!func_table) {
-        *arg_count_out = -1;  // -1 signals unlimited arguments
+        *arg_count_out = -1;
         *len_out = 0;
         return NULL;
     }
-
     for (int i = 0; i < func_count; ++i) {
         if (strcmp(func_table[i].name, name) == 0) {
-            // Lazy-load the function if not loaded
             if (!func_table[i].ptr) {
                 func_table[i].ptr = load_binfunc(name, &func_table[i].arg_count, &func_table[i].len);
                 if (!func_table[i].ptr) {
@@ -367,21 +344,12 @@ static void* get_func_ptr(const char* name, int* arg_count_out, size_t* len_out)
                     return NULL;
                 }
             }
-
-            // If arg_count is negative (e.g., -1), treat as unlimited
-            if (func_table[i].arg_count < 0) {
-                *arg_count_out = -1;  // unlimited
-            } else {
-                *arg_count_out = func_table[i].arg_count;
-            }
-
+            *arg_count_out = func_table[i].arg_count < 0 ? -1 : func_table[i].arg_count;
             *len_out = func_table[i].len;
             return func_table[i].ptr;
         }
     }
-
-    // Function not found
-    *arg_count_out = -1;  // unlimited
+    *arg_count_out = -1;
     *len_out = 0;
     return NULL;
 }
@@ -434,15 +402,14 @@ static int var_index(const char* name) {
     HashNode* node = var_table[h];
     while (node) {
         if (strcmp(node->name, name) == 0) {
-            return node->index;   // O(1) now
+            return node->index;
         }
         node = node->next;
     }
-    // add new var
     VarSlot* s = pool_alloc();
     s->data = strdup(name);
     if (!s->data) { perror("strdup"); exit(EXIT_FAILURE); }
-    HashNode* hn = arena_alloc(sizeof(HashNode));
+    HashNode* hn = arena_alloc_v2(sizeof(HashNode));
     hn->slot = s;
     hn->name = s->data;
     hn->next = var_table[h];
@@ -454,10 +421,9 @@ static int var_index(const char* name) {
         env_array = ne;
         env_alloc_size = ns;
     }
-    hn->index = var_count;   // store the index directly
+    hn->index = var_count;
     env_array[var_count] = s;
-    int idx = var_count++;
-    return idx;
+    return var_count++;
 }
 
 //
@@ -465,7 +431,7 @@ static int var_index(const char* name) {
 //
 static void init_env(int total_vars) {
     if (total_vars <= 0) total_vars = FIXED_VARS * 2;
-    if (total_vars > (1 << 20)) {  // Limit to ~1M
+    if (total_vars > (1 << 20)) {
         fprintf(stderr, "Error: FIXED_VARS too large\n");
         exit(EXIT_FAILURE);
     }
@@ -479,7 +445,7 @@ static void init_env(int total_vars) {
 }
 
 //
-// Enhanced parser that supports nested statements and block syntax
+// Enhanced parser that supports nested statements, block syntax, and literals
 //
 static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir);
 static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt);
@@ -497,9 +463,18 @@ static int find_matching_delim(const char* str, int start, char open, char close
     return (delim_count == 0) ? pos - 1 : -1;
 }
 
-// Enhanced argument parsing for mixed simple/nested/block arguments
-// Parse arguments inside parentheses (args_start .. args_end inclusive).
-// Fills stmt->argc, arg_indices, arg_types, arg_blocks.
+// Helper to check if a string is a numeric literal
+static bool is_numeric_literal(const char* str, int len) {
+    if (len == 0) return false;
+    int i = 0;
+    if (str[0] == '-') i++; // Allow negative numbers
+    for (; i < len; i++) {
+        if (!isdigit((unsigned char)str[i])) return false;
+    }
+    return true;
+}
+
+// Enhanced argument parsing for mixed simple/nested/block/literal arguments
 static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt) {
     // Count arguments by top-level commas
     int arg_count = 0;
@@ -516,22 +491,26 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
     stmt->arg_indices = malloc(sizeof(int) * arg_count);
     stmt->arg_types = malloc(sizeof(int) * arg_count);
     stmt->arg_blocks = malloc(sizeof(StatementBlock) * arg_count);
-    
-    if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks) {
+    stmt->arg_literals = malloc(sizeof(void*) * arg_count);
+    if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks || !stmt->arg_literals) {
         perror("malloc enhanced args");
         free(stmt->arg_indices);
         free(stmt->arg_types);
         free(stmt->arg_blocks);
+        free(stmt->arg_literals);
         return -1;
     }
-    // Initialize blocks
+    // Initialize blocks and literals
     for (int i = 0; i < arg_count; ++i) {
         stmt->arg_blocks[i].stmts = NULL;
         stmt->arg_blocks[i].count = 0;
         stmt->arg_blocks[i].capacity = 0;
+        stmt->arg_literals[i] = NULL;
+        stmt->arg_indices[i] = -1;
+        stmt->arg_types[i] = 0;
     }
 
-    // Parse each argument (split by top-level commas)
+    // Parse each argument
     int current_arg = 0;
     paren_depth = 0;
     const char* arg_start = args_start;
@@ -540,22 +519,17 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
             if (*p == '(') paren_depth++;
             else if (*p == ')') paren_depth--;
         }
-
         if ((p > args_end) || (*p == ',' && paren_depth == 0)) {
             const char* arg_end = (p > args_end) ? args_end : p - 1;
-
-            // Trim whitespace
             while (arg_start <= arg_end && isspace((unsigned char)*arg_start)) arg_start++;
             while (arg_end >= arg_start && isspace((unsigned char)*arg_end)) arg_end--;
-
             int arg_len = (arg_end >= arg_start) ? (int)(arg_end - arg_start + 1) : 0;
 
             if (arg_len <= 0) {
-                // Empty arg -> treat as zero / invalid
                 stmt->arg_types[current_arg] = 0;
                 stmt->arg_indices[current_arg] = -1;
             } else {
-                // Detect inline assignment at top-level of this arg (i.e., '=' not inside parens)
+                // Check for nested assignment
                 bool has_assignment = false;
                 int td = 0;
                 for (const char* q = arg_start; q <= arg_end; ++q) {
@@ -565,66 +539,79 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
                 }
 
                 if (has_assignment) {
-                    // Nested assignment e.g. "m = sum(a,b)"
+                    // Nested assignment
                     stmt->arg_types[current_arg] = 1;
                     IR nested_ir;
                     ir_init(&nested_ir);
-
                     if (parse_expression_enhanced(arg_start, arg_len, &nested_ir) == 0 && nested_ir.count > 0) {
                         stmt->arg_indices[current_arg] = nested_ir.stmts[0].lhs_index;
-                        // store nested statement in a 1-entry StatementBlock
                         StatementBlock* block = &stmt->arg_blocks[current_arg];
                         block->stmts = malloc(sizeof(IRStmt));
                         if (!block->stmts) { 
                             perror("malloc block stmt"); 
                             free(nested_ir.stmts);
+                            free(stmt->arg_indices);
+                            free(stmt->arg_types);
+                            free(stmt->arg_blocks);
+                            free(stmt->arg_literals);
                             return -1; 
                         }
                         block->capacity = 1;
                         block->count = 1;
                         block->stmts[0] = nested_ir.stmts[0];
                     } else {
-                        // parse failed -> mark invalid
                         stmt->arg_indices[current_arg] = -1;
-                        stmt->arg_blocks[current_arg].stmts = NULL;
-                        stmt->arg_blocks[current_arg].count = 0;
-                        stmt->arg_blocks[current_arg].capacity = 0;
                         free(nested_ir.stmts);
+                        free(stmt->arg_indices);
+                        free(stmt->arg_types);
+                        free(stmt->arg_blocks);
+                        free(stmt->arg_literals);
                         return -1;
                     }
-
-                    if (nested_ir.stmts) free(nested_ir.stmts);
+                    free(nested_ir.stmts);
+                } else if (arg_len >= 2 && arg_start[0] == '"' && arg_end[0] == '"') {
+                    // String literal
+                    stmt->arg_types[current_arg] = 3; // Literal
+                    char* literal = arena_alloc_v2(arg_len - 1);
+                    strncpy(literal, arg_start + 1, arg_len - 2);
+                    literal[arg_len - 2] = '\0';
+                    stmt->arg_literals[current_arg] = literal;
+                    stmt->arg_indices[current_arg] = -1;
+                } else if (is_numeric_literal(arg_start, arg_len)) {
+                    // Numeric literal
+                    stmt->arg_types[current_arg] = 3; // Literal
+                    char temp[arg_len + 1];
+                    strncpy(temp, arg_start, arg_len);
+                    temp[arg_len] = '\0';
+                    long* num = arena_alloc_v2(sizeof(long));
+                    *num = atol(temp);
+                    stmt->arg_literals[current_arg] = num;
+                    stmt->arg_indices[current_arg] = -1;
                 } else {
-                    // Simple variable/literal
+                    // Variable
                     stmt->arg_types[current_arg] = 0;
                     char simple_var[MAX_NAME_LEN];
                     if (arg_len < MAX_NAME_LEN) {
                         strncpy(simple_var, arg_start, arg_len);
                         simple_var[arg_len] = '\0';
-                        // Trim again to be safe
                         char *s = simple_var;
                         while (*s && isspace((unsigned char)*s)) s++;
-                        // if s changed, shift
                         if (s != simple_var) memmove(simple_var, s, strlen(s) + 1);
                         stmt->arg_indices[current_arg] = var_index(simple_var);
                     } else {
-                        // name too long -> treat as invalid
                         stmt->arg_indices[current_arg] = -1;
                     }
                 }
             }
-
             current_arg++;
             arg_start = p + 1;
         }
     }
-
     return 0;
 }
 
 // Enhanced parse_expression with block support
 static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir) {
-    // Look for assignment pattern: var = func(args) or var = func{block}
     const char* eq = NULL;
     for (int i = 0; i < expr_len; i++) {
         if (expr[i] == '=') {
@@ -632,90 +619,68 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
             break;
         }
     }
-    
-    if (!eq) return -1; // Not an assignment
-    
-    // Parse LHS variable
+    if (!eq) return -1;
     const char* lhs_start = expr;
     const char* lhs_end = eq - 1;
     while (lhs_start < lhs_end && isspace(*lhs_start)) lhs_start++;
     while (lhs_end > lhs_start && isspace(*lhs_end)) lhs_end--;
-    
     if (lhs_start >= lhs_end) return -1;
-    
     int lhs_len = lhs_end - lhs_start + 1;
     char lhs[MAX_NAME_LEN];
     if (lhs_len >= MAX_NAME_LEN) return -1;
     strncpy(lhs, lhs_start, lhs_len);
     lhs[lhs_len] = '\0';
-    
-    // Find function name and arguments/blocks
     const char* rhs = eq + 1;
     while (isspace(*rhs)) rhs++;
-    
-    // Look for either parentheses or braces
-        // We require parentheses for the argument list: rhs must contain '('
     const char* open_delim = strchr(rhs, '(');
     if (!open_delim) return -1;
     char close_delim = ')';
-
-    
-    // Extract function name
     const char* fname_end = open_delim - 1;
     while (fname_end > rhs && isspace(*fname_end)) fname_end--;
     int fname_len = fname_end - rhs + 1;
     if (fname_len <= 0 || fname_len >= MAX_NAME_LEN) return -1;
-    
     char fname[MAX_NAME_LEN];
     strncpy(fname, rhs, fname_len);
     fname[fname_len] = '\0';
-    
-    // Find matching closing delimiter
     int close_pos = find_matching_delim(rhs, open_delim - rhs, *open_delim, close_delim);
     if (close_pos < 0) return -1;
-    
-    // Parse arguments/blocks
     const char* content_start = open_delim + 1;
     const char* content_end = rhs + close_pos - 1;
-    
-    // Skip whitespace
     while (content_start < content_end && isspace(*content_start)) content_start++;
     while (content_end > content_start && isspace(*content_end)) content_end--;
-    
-    // Create IR statement
     IRStmt* stmt = ir_alloc_stmt(nested_ir);
     stmt->lhs_index = var_index(lhs);
     strncpy(stmt->func_name, fname, MAX_NAME_LEN);
-    
     if (content_start < content_end) {
         if (close_delim == '}') {
-            // Block syntax - parse as statement block
             stmt->argc = 1;
             stmt->arg_indices = malloc(sizeof(int));
             stmt->arg_types = malloc(sizeof(int));
             stmt->arg_blocks = malloc(sizeof(StatementBlock));
-            
-            if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks) {
+            stmt->arg_literals = malloc(sizeof(void*));
+            if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks || !stmt->arg_literals) {
                 perror("malloc block args");
                 free(stmt->arg_indices);
                 free(stmt->arg_types);
                 free(stmt->arg_blocks);
+                free(stmt->arg_literals);
                 return -1;
             }
-
-            stmt->arg_indices[0] = -1; // No simple variable
-            stmt->arg_types[0] = 2;    // Statement block
-            
+            stmt->arg_indices[0] = -1;
+            stmt->arg_types[0] = 2;
+            stmt->arg_literals[0] = NULL;
             StatementBlock* block = &stmt->arg_blocks[0];
             block->stmts = NULL;
             block->count = 0;
             block->capacity = 0;
-            
             if (parse_argument_block(content_start, content_end, block) != 0) {
+                free(stmt->arg_indices);
+                free(stmt->arg_types);
+                free(stmt->arg_blocks);
+                free(stmt->arg_literals);
                 return -1;
             }
         } else {
-            // Parentheses syntax - parse as enhanced arguments
             if (parse_enhanced_arguments(content_start, content_end, stmt) != 0) {
                 return -1;
             }
@@ -725,8 +690,8 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
         stmt->arg_indices = NULL;
         stmt->arg_types = NULL;
         stmt->arg_blocks = NULL;
+        stmt->arg_literals = NULL;
     }
-    
     return 0;
 }
 
@@ -737,8 +702,6 @@ static int parse_argument_block(const char* arg_start, const char* arg_end, Stat
     block->capacity = 0;
     IR temp_ir;
     ir_init(&temp_ir);
-
-    // Parse the block content as a series of statements
     const char* p = arg_start;
     while (p <= arg_end) {
         const char* line_end = strchr(p, '\n');
@@ -754,83 +717,20 @@ static int parse_argument_block(const char* arg_start, const char* arg_end, Stat
         }
         p = line_end + 1;
     }
-
-    // Move temp_ir to block
     block->stmts = temp_ir.stmts;
     block->count = temp_ir.count;
     block->capacity = temp_ir.capacity;
-    temp_ir.stmts = NULL; // Prevent double-free
+    temp_ir.stmts = NULL;
     return 0;
 }
 
-// Enhanced parse_line_v3 function
-static int parse_line_v3(const char* line, IR* ir, int line_num) {
-    const char* p = line;
-    while (isspace((unsigned char)*p)) ++p;
-    if (*p == '\0' || (p[0] == '-' && p[1] == '-')) return 0;  // Empty or comment
-
-    // Find the closing parenthesis or brace of the function call as end marker
-    // Look for assignment pattern first: var = func(args) or var = func{block}
-    const char* eq = strchr(p, '=');
-    if (!eq) {
-        if (strict_mode) {
-            fprintf(stderr, "Parse error at line %d: no '=' in assignment: %s\n", line_num, line);
-            return -1;
-        }
-        return 0; // Skip in non-strict mode
-    }
-    
-    // Find the opening delimiter after the '='
-    const char* open_paren = strchr(eq + 1, '(');
-    const char* open_brace = strchr(eq + 1, '{');
-    
-    const char* open_delim = NULL;
-    char close_delim = ')';
-    
-    if (open_paren && (!open_brace || open_paren < open_brace)) {
-        open_delim = open_paren;
-        close_delim = ')';
-    } else if (open_brace) {
-        open_delim = open_brace;
-        close_delim = '}';
-    }
-    
-    if (!open_delim) {
-        if (strict_mode) {
-            fprintf(stderr, "Parse error at line %d: no '(' or '{' in function call: %s\n", line_num, line);
-            return -1;
-        }
-        return 0; // Skip in non-strict mode
-    }
-    
-    // Find matching closing delimiter
-    int close_delim_pos = find_matching_delim(eq + 1, open_delim - (eq + 1), *open_delim, close_delim);
-    if (close_delim_pos < 0) {
-        if (strict_mode) {
-            fprintf(stderr, "Parse error at line %d: unmatched delimiters: %s\n", line_num, line);
-            return -1;
-        }
-        return 0; // Skip in non-strict mode
-    }
-    
-    // Calculate line length up to and including the closing delimiter
-    const char* close_delim_ptr = eq + 1 + close_delim_pos;
-    int line_len = close_delim_ptr - p + 1;
-    
-    return parse_expression_enhanced(p, line_len, ir);
-}
-
-//
-// Enhanced executor with bin-to-bin support and statement block execution
-//
+// Enhanced executor with bin-to-bin support and literal support
 static BinContext global_bin_context;
 static long* args_buffer = NULL;
 static size_t args_buffer_size = 0;
 
-// Helper function for bin functions to call other bin functions
 void* optivar_get_func(struct BinContext* ctx, const char* name) {
     if (!ctx || !ctx->func_table) return NULL;
-    
     for (int i = 0; i < ctx->func_count; i++) {
         if (strcmp(ctx->func_table[i].name, name) == 0) {
             if (!ctx->func_table[i].ptr) {
@@ -846,127 +746,98 @@ void* optivar_get_func(struct BinContext* ctx, const char* name) {
     return NULL;
 }
 
-// Helper function to execute a statement block
 static void execute_statement_block(struct BinContext* ctx, StatementBlock* block) {
     if (!ctx || !block || block->count <= 0) return;
-    
     for (int i = 0; i < block->count; i++) {
         IRStmt* stmt = &block->stmts[i];
-        
-        // Resolve function pointer if needed
         if (!stmt->func_ptr && stmt->func_name[0]) {
             size_t len;
             int arg_count;
             stmt->func_ptr = get_func_ptr(stmt->func_name, &arg_count, &len);
         }
-        
         if (!stmt->func_ptr) {
             if (strict_mode) {
                 fprintf(stderr, "Error: function '%s' not found\n", stmt->func_name);
                 continue;
             }
-            continue; // Skip missing functions in non-strict mode
+            continue;
         }
-        
-        // Prepare arguments
         if ((size_t)stmt->argc > ctx->temp_buffer_size) {
             ctx->temp_buffer_size = stmt->argc * 2;
             ctx->temp_buffer = realloc(ctx->temp_buffer, sizeof(long) * ctx->temp_buffer_size);
             if (!ctx->temp_buffer) { perror("realloc temp_buffer"); exit(EXIT_FAILURE); }
         }
-        
         for (int j = 0; j < stmt->argc; j++) {
             if (stmt->arg_types && stmt->arg_types[j] == 2) {
-                // Execute statement block first
                 execute_statement_block(ctx, &stmt->arg_blocks[j]);
             }
-            
-            int idx = stmt->arg_indices[j];
-            ctx->temp_buffer[j] = (idx >= 0 && ctx->env[idx]) ? ctx->env[idx]->value : 0;
+            if (stmt->arg_types && stmt->arg_types[j] == 3) {
+                ctx->temp_buffer[j] = stmt->arg_literals[j] ? *(long*)stmt->arg_literals[j] : 0;
+            } else {
+                int idx = stmt->arg_indices[j];
+                ctx->temp_buffer[j] = (idx >= 0 && ctx->env[idx]) ? ctx->env[idx]->value : 0;
+            }
         }
-        
-        // Get LHS variable
         VarSlot* lhs = (stmt->lhs_index >= 0) ? ctx->env[stmt->lhs_index] : NULL;
         if (!lhs) continue;
-        
-        // Call the bin function
         BinFunc fn = (BinFunc)stmt->func_ptr;
         fn(&lhs->value, 
            (stmt->argc > 0) ? ctx->temp_buffer : NULL,
            stmt->arg_blocks, 
+           stmt->arg_literals, 
            stmt->argc, 
            ctx);
     }
 }
 
-
 static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
     if (!stmts || stmt_count <= 0) return;
-
-    // Initialize global bin context
     global_bin_context.env = env;
     global_bin_context.func_table = func_table;
     global_bin_context.func_count = func_count;
     global_bin_context.temp_buffer = NULL;
     global_bin_context.temp_buffer_size = 0;
-
-    // Ensure main args buffer
-    if ((size_t)stmt_count * 16 > args_buffer_size) { // Estimate max args needed
+    if ((size_t)stmt_count * 16 > args_buffer_size) {
         args_buffer_size = stmt_count * 16;
         args_buffer = realloc(args_buffer, sizeof(long) * args_buffer_size);
         if (!args_buffer) { perror("realloc args_buffer"); exit(EXIT_FAILURE); }
     }
-
-    // Execute each top-level statement
     for (int i = 0; i < stmt_count; ++i) {
         IRStmt* stmt = &stmts[i];
-        
         if (stmt->dead || stmt->lhs_index < 0) continue;
-        
-        // Resolve function pointer if needed
         if (!stmt->func_ptr && stmt->func_name[0]) {
             size_t len;
             int arg_count;
             stmt->func_ptr = get_func_ptr(stmt->func_name, &arg_count, &len);
         }
-        
         if (!stmt->func_ptr) {
             if (strict_mode) {
                 fprintf(stderr, "Error: function '%s' not found\n", stmt->func_name);
                 exit(EXIT_FAILURE);
             }
-            continue; // Skip missing functions in non-strict mode
+            continue;
         }
-        
-        // Only handle nested assignments (arg_types == 1)
-        if (stmt->arg_types) {
-            for (int j = 0; j < stmt->argc; j++) {
-                if (stmt->arg_types[j] == 1) {
-                    // Optionally handle nested assignment here
-                }
+        for (int j = 0; j < stmt->argc; ++j) {
+            if (stmt->arg_types[j] == 2) {
+                execute_statement_block(&global_bin_context, &stmt->arg_blocks[j]);
+            }
+            if (stmt->arg_types[j] == 3) {
+                args_buffer[j] = stmt->arg_literals[j] ? *(long*)stmt->arg_literals[j] : 0;
+            } else {
+                int idx = stmt->arg_indices[j];
+                args_buffer[j] = (idx >= 0 && env[idx]) ? env[idx]->value : 0;
             }
         }
-
-        // Prepare arguments
-        for (int j = 0; j < stmt->argc; ++j) {
-            int idx = stmt->arg_indices[j];
-            args_buffer[j] = (idx >= 0 && env[idx]) ? env[idx]->value : 0;
-        }
-
-        // Get LHS variable
         VarSlot* lhs = env[stmt->lhs_index];
         if (!lhs) continue;
-
-        // Call the bin function with enhanced context
         BinFunc fn = (BinFunc)stmt->func_ptr;
         fn(&lhs->value,
            (stmt->argc > 0) ? args_buffer : NULL,
            stmt->arg_blocks,
+           stmt->arg_literals,
            stmt->argc,
            &global_bin_context);
     }
-    
-    // Cleanup temp buffer
     if (global_bin_context.temp_buffer) {
         free(global_bin_context.temp_buffer);
         global_bin_context.temp_buffer = NULL;
@@ -975,33 +846,24 @@ static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
 }
 
 static void cleanup_all() {
-    // Free environment variables
     if (env_array) {
         for (int i = 0; i < var_count; ++i)
             if (env_array[i] && env_array[i]->data) free(env_array[i]->data);
         free(env_array);
         env_array = NULL;
     }
-
-    // Free variable hash table (nodes only, slots already freed)
     if (var_table) {
         for (int i = 0; i < var_table_size; ++i) {
             HashNode* node = var_table[i];
             while (node) {
                 HashNode* nx = node->next;
-                // node->slot already freed
-                // node->name points into slot->data, already freed
                 node = nx;
             }
         }
         free(var_table);
         var_table = NULL;
     }
-
-    // Free fixed pool
     if (fixed_pool) { free(fixed_pool); fixed_pool = NULL; }
-
-    // Free dynamic pool chunks
     VarPoolChunk* c = dynamic_pool;
     while (c) {
         VarPoolChunk* nx = c->next;
@@ -1009,8 +871,6 @@ static void cleanup_all() {
         c = nx;
     }
     dynamic_pool = NULL;
-
-    // Free preloaded .bin functions
     if (func_table) {
         for (int i = 0; i < func_count; ++i)
             if (func_table[i].ptr && func_table[i].len > 0)
@@ -1018,11 +878,7 @@ static void cleanup_all() {
         free(func_table);
         func_table = NULL;
     }
-
-    // Free arena memory
     arena_free();
-
-    // Free static executor args buffer
     if (args_buffer) {
         free(args_buffer);
         args_buffer = NULL;
@@ -1030,23 +886,17 @@ static void cleanup_all() {
     }
 }
 
-// Read a complete "block" from file f: accumulate lines until parentheses balance
-// Returns a malloc'd zero-terminated string (caller must free) and sets *out_lines_read.
-// If EOF reached without content, returns NULL and *out_lines_read = 0.
 static char* read_block(FILE* f, int *out_lines_read) {
     char *line = NULL;
     size_t lcap = 0;
     ssize_t r;
-
     size_t bufcap = 4096;
     char *buf = malloc(bufcap);
     if (!buf) { perror("malloc read_block"); exit(EXIT_FAILURE); }
     size_t buflen = 0;
-
     int depth = 0;
     int lines = 0;
     int have_eq = 0;
-
     while ((r = getline(&line, &lcap, f)) != -1) {
         lines++;
         if (buflen + (size_t)r + 1 > bufcap) {
@@ -1058,32 +908,22 @@ static char* read_block(FILE* f, int *out_lines_read) {
         memcpy(buf + buflen, line, (size_t)r);
         buflen += (size_t)r;
         buf[buflen] = '\0';
-
-        // Update paren depth and '=' flag
         for (ssize_t i = 0; i < r; ++i) {
             char c = line[i];
             if (c == '(') depth++;
             else if (c == ')') depth--;
             else if (c == '=') have_eq = 1;
         }
-
-        // If parentheses balanced (depth <= 0) and we have an '=', treat as complete statement.
         if (depth <= 0 && have_eq) break;
     }
-
     free(line);
-
     if (buflen == 0) { free(buf); *out_lines_read = 0; return NULL; }
-
-    // Trim trailing newlines
     while (buflen > 0 && (buf[buflen-1] == '\n' || buf[buflen-1] == '\r')) {
         buf[--buflen] = '\0';
     }
-
     *out_lines_read = lines;
     return buf;
 }
-
 
 //
 // Script parsing and execution
@@ -1101,19 +941,16 @@ static IR* parse_script_file(const char* path) {
         return NULL;
     }
     ir_init(ir);
-
     int line_num = 1;
     while (1) {
         int consumed = 0;
         char *block = read_block(f, &consumed);
-        if (!block) break; // EOF or nothing to read
-
+        if (!block) break;
         if (parse_line_v3(block, ir, line_num) == -1) {
             if (strict_mode) {
                 fprintf(stderr, "Parse error in %s at line %d: %s\n", path, line_num, block);
                 free(block);
                 fclose(f);
-                // cleanup IR memory (same as before)
                 if (ir->stmts) {
                     for (int i = 0; i < ir->count; i++) {
                         if (ir->stmts[i].arg_blocks) {
@@ -1126,21 +963,18 @@ static IR* parse_script_file(const char* path) {
                         }
                         if (ir->stmts[i].arg_types) free(ir->stmts[i].arg_types);
                         if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
+                        if (ir->stmts[i].arg_literals) free(ir->stmts[i].arg_literals);
                     }
                     free(ir->stmts);
                 }
                 free(ir);
                 return NULL;
             }
-            // Non-strict: ignore this block and continue
         }
-
         line_num += consumed;
         free(block);
     }
-
     fclose(f);
-
     if (ir->count == 0) {
         fprintf(stderr, "Warning: no valid statements in %s\n", path);
         if (ir->stmts) free(ir->stmts);
@@ -1156,10 +990,7 @@ static void run_script(const char* path) {
         fprintf(stderr, "Error: failed to parse script %s\n", path);
         return;
     }
-
     executor_enhanced(ir->stmts, ir->count, env_array);
-
-    // Cleanup IR memory
     if (ir->stmts) {
         for (int i = 0; i < ir->count; i++) {
             if (ir->stmts[i].arg_blocks) {
@@ -1172,6 +1003,7 @@ static void run_script(const char* path) {
             }
             if (ir->stmts[i].arg_types) free(ir->stmts[i].arg_types);
             if (ir->stmts[i].arg_indices) free(ir->stmts[i].arg_indices);
+            if (ir->stmts[i].arg_literals) free(ir->stmts[i].arg_literals);
         }
         free(ir->stmts);
     }
@@ -1185,21 +1017,14 @@ int preload_all = 0;
 char *preload_list = NULL;
 
 int main(int argc, char **argv) {
-    // Ensure resources are cleaned up on exit
     atexit(cleanup_all);
-
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N] [--preload|--preload=list:bin1,bin2,...] [--strict]\n", argv[0]);
         return 1;
     }
-
-    // Default config
     FIXED_VARS = DEFAULT_FIXED_VARS;
     var_table_size = 4096;
-
     char *script_path = NULL;
-
-    // Parse command-line arguments
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--fixed-vars=", 13) == 0) {
             FIXED_VARS = atoi(argv[i] + 13);
@@ -1216,26 +1041,19 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--preload") == 0) {
             preload_all = 1;
         } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
-            preload_list = argv[i] + 15; // skip "list:"
+            preload_list = argv[i] + 15;
         } else if (strcmp(argv[i], "--strict") == 0) {
             strict_mode = 1;
         } else if (argv[i][0] != '-') {
             script_path = argv[i];
         }
     }
-
     if (!script_path) {
         fprintf(stderr, "Error: no script specified\n");
         return 1;
     }
-
-    // Initialize environment
     init_env(FIXED_VARS * 2);
-
-    // Load function table (names only)
     preload_binfuncs("./funcs");
-
-    // Preload requested bins
     if (preload_all) {
         for (int i = 0; i < func_count; i++) {
             if (!func_table[i].ptr) {
@@ -1263,9 +1081,6 @@ int main(int argc, char **argv) {
         }
         free(list_copy);
     }
-
-    // Run the script
     run_script(script_path);
-
-    return 0; // cleanup_all() runs automatically here
+    return 0;
 }
