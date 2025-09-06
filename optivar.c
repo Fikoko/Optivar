@@ -60,11 +60,11 @@ typedef struct IRStmt {
     char func_name[MAX_NAME_LEN]; // store the function name
     
     // Enhanced nested statement support
-    StatementBlock* arg_blocks;    // Array of statement blocks (one per argument)
+    struct StatementBlock* arg_blocks;    // Array of statement blocks (one per argument)
     int* arg_types;                // 0=simple var, 1=nested assignment, 2=statement block
     
     char pad[CACHE_LINE - 4*sizeof(int) - sizeof(void*) - sizeof(int*) - MAX_NAME_LEN - 
-             sizeof(StatementBlock*) - sizeof(int*)];
+             sizeof(struct StatementBlock*) - sizeof(int*)];
 } IRStmt;
 
 // Add static assertions after type definitions
@@ -73,7 +73,7 @@ static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 
 // Enhanced bin function signature with context for bin-to-bin calls
 typedef void (*BinFunc)(long* lhs, long* args, 
-                       StatementBlock* arg_blocks, int argc,
+                       struct StatementBlock* arg_blocks, int argc,
                        struct BinContext* ctx);
 
 // Context passed to bin functions for direct bin-to-bin calls
@@ -154,44 +154,30 @@ typedef struct {
 //
 #define ARENA_DEFAULT_SIZE (16 * 1024 * 1024)  // 16 MB default
 
-static char* arena_ptr = NULL;    // start of buffer
-static size_t arena_size = 0;     // total allocated
-static size_t arena_used = 0;     // current offset
+static char *arena_ptr = NULL;
+static size_t arena_size = 0;
+static size_t arena_used = 0;
 
-// ----------------------
-// Arena helpers
-// ----------------------
-#define ARENA_ALIGN 64
-static void* arena_alloc(size_t size) {
-    size = (size + ARENA_ALIGN - 1) & ~(ARENA_ALIGN - 1); // align
-    if (!arena_ptr) {
-        arena_size = (size > ARENA_DEFAULT_SIZE) ? size : ARENA_DEFAULT_SIZE;
-        arena_ptr = malloc(arena_size);
-        if (!arena_ptr) { perror("malloc arena"); exit(EXIT_FAILURE); }
-        arena_used = 0;
-    }
+void* arena_alloc_v2(size_t size) {
     if (arena_used + size > arena_size) {
-        if (arena_size > SIZE_MAX / 2 || arena_used > SIZE_MAX - size) {
-            fprintf(stderr, "Error: arena size overflow\n");
+        // Grow arena exponentially
+        size_t new_size = arena_size * 2;
+        if (new_size < arena_used + size) 
+            new_size = arena_used + size + ((arena_used + size) / 2);
+
+        char *new_ptr = realloc(arena_ptr, new_size);
+        if (!new_ptr) {
+            perror("arena realloc failed");
             exit(EXIT_FAILURE);
         }
-        size_t new_size = arena_size * 2;
-        while (arena_used + size > new_size) {
-            if (new_size > SIZE_MAX / 2) {
-                fprintf(stderr, "Error: arena size overflow\n");
-                exit(EXIT_FAILURE);
-            }
-            new_size *= 2;
-        }
-        char* new_ptr = realloc(arena_ptr, new_size);
-        if (!new_ptr) { perror("realloc arena"); exit(EXIT_FAILURE); }
         arena_ptr = new_ptr;
         arena_size = new_size;
     }
-    void* out = arena_ptr + arena_used;
+    void *ptr = arena_ptr + arena_used;
     arena_used += size;
-    return out;
+    return ptr;
 }
+
 
 // reset arena (does not free buffer, just resets usage)
 static void arena_reset() {
@@ -529,14 +515,20 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
     stmt->argc = arg_count;
     stmt->arg_indices = malloc(sizeof(int) * arg_count);
     stmt->arg_types = malloc(sizeof(int) * arg_count);
+    stmt->arg_blocks = malloc(sizeof(StatementBlock) * arg_count);
     
     if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks) {
         perror("malloc enhanced args");
+        free(stmt->arg_indices);
+        free(stmt->arg_types);
+        free(stmt->arg_blocks);
         return -1;
     }
     // Initialize blocks
     for (int i = 0; i < arg_count; ++i) {
         stmt->arg_blocks[i].stmts = NULL;
+        stmt->arg_blocks[i].count = 0;
+        stmt->arg_blocks[i].capacity = 0;
     }
 
     // Parse each argument (split by top-level commas)
@@ -583,7 +575,11 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
                         // store nested statement in a 1-entry StatementBlock
                         StatementBlock* block = &stmt->arg_blocks[current_arg];
                         block->stmts = malloc(sizeof(IRStmt));
-                        if (!block->stmts) { perror("malloc block stmt"); return -1; }
+                        if (!block->stmts) { 
+                            perror("malloc block stmt"); 
+                            free(nested_ir.stmts);
+                            return -1; 
+                        }
                         block->capacity = 1;
                         block->count = 1;
                         block->stmts[0] = nested_ir.stmts[0];
@@ -593,6 +589,8 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
                         stmt->arg_blocks[current_arg].stmts = NULL;
                         stmt->arg_blocks[current_arg].count = 0;
                         stmt->arg_blocks[current_arg].capacity = 0;
+                        free(nested_ir.stmts);
+                        return -1;
                     }
 
                     if (nested_ir.stmts) free(nested_ir.stmts);
@@ -697,6 +695,14 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
             stmt->arg_types = malloc(sizeof(int));
             stmt->arg_blocks = malloc(sizeof(StatementBlock));
             
+            if (!stmt->arg_indices || !stmt->arg_types || !stmt->arg_blocks) {
+                perror("malloc block args");
+                free(stmt->arg_indices);
+                free(stmt->arg_types);
+                free(stmt->arg_blocks);
+                return -1;
+            }
+
             stmt->arg_indices[0] = -1; // No simple variable
             stmt->arg_types[0] = 2;    // Statement block
             
@@ -705,10 +711,14 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
             block->count = 0;
             block->capacity = 0;
             
-            parse_argument_block(content_start, content_end, block);
+            if (parse_argument_block(content_start, content_end, block) != 0) {
+                return -1;
+            }
         } else {
             // Parentheses syntax - parse as enhanced arguments
-            parse_enhanced_arguments(content_start, content_end, stmt);
+            if (parse_enhanced_arguments(content_start, content_end, stmt) != 0) {
+                return -1;
+            }
         }
     } else {
         stmt->argc = 0;
@@ -717,6 +727,39 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
         stmt->arg_blocks = NULL;
     }
     
+    return 0;
+}
+
+// Implementation of parse_argument_block
+static int parse_argument_block(const char* arg_start, const char* arg_end, StatementBlock* block) {
+    block->stmts = NULL;
+    block->count = 0;
+    block->capacity = 0;
+    IR temp_ir;
+    ir_init(&temp_ir);
+
+    // Parse the block content as a series of statements
+    const char* p = arg_start;
+    while (p <= arg_end) {
+        const char* line_end = strchr(p, '\n');
+        if (!line_end || line_end > arg_end) line_end = arg_end + 1;
+        int line_len = line_end - p;
+        if (line_len > 0) {
+            if (parse_expression_enhanced(p, line_len, &temp_ir) != 0) {
+                if (strict_mode) {
+                    free(temp_ir.stmts);
+                    return -1;
+                }
+            }
+        }
+        p = line_end + 1;
+    }
+
+    // Move temp_ir to block
+    block->stmts = temp_ir.stmts;
+    block->count = temp_ir.count;
+    block->capacity = temp_ir.capacity;
+    temp_ir.stmts = NULL; // Prevent double-free
     return 0;
 }
 
