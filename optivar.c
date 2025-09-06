@@ -665,17 +665,41 @@ static int parse_line_v3(const char* line, IR* ir, int line_num) {
     while (isspace((unsigned char)*p)) ++p;
     if (*p == '\0' || (p[0] == '-' && p[1] == '-')) return 0;  // Empty or comment
 
-    // Find semicolon
-    const char* semi = strchr(p, ';');
-    if (!semi) {
+    // Find the closing parenthesis of the function call as end marker
+    // Look for assignment pattern first: var = func(args)
+    const char* eq = strchr(p, '=');
+    if (!eq) {
         if (strict_mode) {
-            fprintf(stderr, "Parse error at line %d: no ';' in line: %s\n", line_num, line);
+            fprintf(stderr, "Parse error at line %d: no '=' in assignment: %s\n", line_num, line);
             return -1;
         }
         return 0; // Skip in non-strict mode
     }
     
-    int line_len = semi - p;
+    // Find the opening parenthesis after the '='
+    const char* open_paren = strchr(eq + 1, '(');
+    if (!open_paren) {
+        if (strict_mode) {
+            fprintf(stderr, "Parse error at line %d: no '(' in function call: %s\n", line_num, line);
+            return -1;
+        }
+        return 0; // Skip in non-strict mode
+    }
+    
+    // Find matching closing parenthesis
+    int close_paren_pos = find_matching_paren(eq + 1, open_paren - (eq + 1));
+    if (close_paren_pos < 0) {
+        if (strict_mode) {
+            fprintf(stderr, "Parse error at line %d: unmatched parentheses: %s\n", line_num, line);
+            return -1;
+        }
+        return 0; // Skip in non-strict mode
+    }
+    
+    // Calculate line length up to and including the closing parenthesis
+    const char* close_paren = eq + 1 + close_paren_pos;
+    int line_len = close_paren - p + 1;
+    
     return parse_expression(p, line_len, ir);
 }
 
