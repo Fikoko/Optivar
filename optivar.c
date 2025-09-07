@@ -1,4 +1,4 @@
-// optivar.c -- superoptimized, memory-safe, minimal, scalable IR executor
+// optivar.c -- superoptimized, memory-safe, minimal, scalable IR executor with strict syntax
 // Build: gcc -O3 -march=native -lz -o optivar optivar.c
 
 #define _GNU_SOURCE
@@ -32,7 +32,7 @@
 //
 static int FIXED_VARS = DEFAULT_FIXED_VARS;
 static int var_table_size = 4096;
-static int strict_mode = 0;  // 0 = skip missing functions, 1 = stop
+static int strict_mode = 1;  // Default to strict mode for OPTIVAR syntax
 
 //
 // Basic types
@@ -460,12 +460,73 @@ static void init_env(int total_vars) {
 }
 
 //
-// Enhanced parser with universal type
+// STRICT OPTIVAR SYNTAX VALIDATION HELPERS
 //
-static int parse_line_v3(const char* line, IR* ir, int line_num);
-static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir);
-static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt);
-static int parse_inline_block(const char* block_start, const char* block_end, StatementBlock* block);
+
+// Helper to validate that a string represents a valid function call (contains parentheses)
+static bool is_valid_function_call(const char* str, int len) {
+    if (len <= 2) return false; // Must have at least "f()"
+    
+    // Find opening parenthesis
+    const char* open_paren = NULL;
+    for (int i = 0; i < len; i++) {
+        if (str[i] == '(') {
+            open_paren = str + i;
+            break;
+        }
+    }
+    
+    if (!open_paren || open_paren == str) return false; // No paren or starts with paren
+    
+    // Must end with closing parenthesis
+    if (str[len - 1] != ')') return false;
+    
+    // Validate function name (before opening paren)
+    for (const char* p = str; p < open_paren; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_') return false;
+    }
+    
+    return true;
+}
+
+// Helper to check if a string is a bare variable name (no function call)
+static bool is_bare_variable(const char* str, int len) {
+    if (len <= 0) return false;
+    
+    // Check if it's a valid identifier without parentheses
+    for (int i = 0; i < len; i++) {
+        char c = str[i];
+        if (c == '(' || c == ')') return false; // Has parentheses, so it's a function call
+        if (!isalnum((unsigned char)c) && c != '_') return false; // Invalid identifier char
+    }
+    return true;
+}
+
+// Helper to check if a string is a bare literal (number or string)
+static bool is_bare_literal(const char* str, int len) {
+    if (len <= 0) return false;
+    
+    // Check for string literal
+    if (len >= 2 && str[0] == '"' && str[len-1] == '"') {
+        return true;
+    }
+    
+    // Check for numeric literal
+    int i = 0;
+    if (str[0] == '-') i++; // Allow negative numbers
+    for (; i < len; i++) {
+        if (!isdigit((unsigned char)str[i])) return false;
+    }
+    return i > (str[0] == '-' ? 1 : 0); // Must have at least one digit
+}
+
+//
+// Enhanced parser with strict OPTIVAR syntax validation
+//
+static int parse_line_strict(const char* line, IR* ir, int line_num);
+static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir);
+static int parse_strict_arguments(const char* args_start, const char* args_end, IRStmt* stmt);
+static int parse_inline_block_strict(const char* block_start, const char* block_end, StatementBlock* block);
 
 // Helper to find matching delimiter (handles only () )
 static int find_matching_delim(const char* str, int start, char open, char close) {
@@ -479,19 +540,8 @@ static int find_matching_delim(const char* str, int start, char open, char close
     return (delim_count == 0) ? pos - 1 : -1;
 }
 
-// Helper to check if a string is a numeric literal
-static bool is_numeric_literal(const char* str, int len) {
-    if (len == 0) return false;
-    int i = 0;
-    if (str[0] == '-') i++; // Allow negative numbers
-    for (; i < len; i++) {
-        if (!isdigit((unsigned char)str[i])) return false;
-    }
-    return true;
-}
-
-// Parse inline block of comma-separated statements (newlines allowed for formatting)
-static int parse_inline_block(const char* block_start, const char* block_end, StatementBlock* block) {
+// Parse inline block with strict validation
+static int parse_inline_block_strict(const char* block_start, const char* block_end, StatementBlock* block) {
     block_init(block);
 
     // Count statements by top-level commas (paren-aware)
@@ -518,7 +568,7 @@ static int parse_inline_block(const char* block_start, const char* block_end, St
             if (stmt_len > 0) {
                 IR nested_ir;
                 ir_init(&nested_ir);
-                if (parse_expression_enhanced(stmt_start, stmt_len, &nested_ir) == 0 && nested_ir.count > 0) {
+                if (parse_expression_strict(stmt_start, stmt_len, &nested_ir) == 0 && nested_ir.count > 0) {
                     IRStmt* block_stmt = block_alloc_stmt(block);
                     *block_stmt = nested_ir.stmts[0];
                 } else {
@@ -538,8 +588,8 @@ static int parse_inline_block(const char* block_start, const char* block_end, St
     return block->count > 0 ? 0 : -1;
 }
 
-// Enhanced argument parsing for universal type (handles inline blocks and newline formatting)
-static int parse_enhanced_arguments(const char* args_start, const char* args_end, IRStmt* stmt) {
+// Strict argument parsing enforcing OPTIVAR rules
+static int parse_strict_arguments(const char* args_start, const char* args_end, IRStmt* stmt) {
     // Count arguments by top-level commas (paren-aware)
     int arg_count = 0;
     int paren_depth = 0;
@@ -565,97 +615,93 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
     const char* arg_start = args_start;
     for (const char* p = args_start; p <= args_end + 1; ++p) {
         if (p > args_end || (*p == ',' && paren_depth == 0)) {
-            const char* arg_end = (p > block_end) ? args_end : p - 1;
+            const char* arg_end = (p > args_end) ? args_end : p - 1;
             while (arg_start <= arg_end && isspace((unsigned char)*arg_start)) arg_start++;
             while (arg_end >= arg_start && isspace((unsigned char)*arg_end)) arg_end--;
             int arg_len = (arg_end >= arg_start) ? (int)(arg_end - arg_start + 1) : 0;
 
             if (arg_len <= 0) {
-                stmt->args[current_arg] = NULL;
-            } else {
-                // Check for inline block (contains '=')
-                bool is_block = false;
-                if (arg_start[0] == '(') {
-                    int close_pos = find_matching_delim(arg_start, 0, '(', ')');
-                    if (close_pos == arg_len - 1) {
-                        int td = 0;
-                        for (const char* q = arg_start; q <= arg_end; ++q) {
-                            if (*q == '(') td++;
-                            else if (*q == ')') td--;
-                            else if (*q == '=' && td == 0) {
-                                is_block = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+                fprintf(stderr, "Error: Empty argument not allowed in strict OPTIVAR mode\n");
+                return -1;
+            }
 
-                if (is_block) {
-                    // Parse as a StatementBlock
-                    StatementBlock* block = arena_alloc_v2(sizeof(StatementBlock));
-                    block_init(block);
-                    if (parse_inline_block(arg_start + 1, arg_end - 1, block) == 0) {
-                        stmt->args[current_arg] = block;
-                    } else {
-                        free(block->stmts);
-                        stmt->args[current_arg] = NULL;
-                        return -1;
-                    }
-                } else {
-                    // Check for nested assignment
-                    bool has_assignment = false;
-                    int td = 0;
-                    for (const char* q = arg_start; q <= arg_end; ++q) {
-                        if (*q == '(') td++;
-                        else if (*q == ')') td--;
-                        else if (*q == '=' && td == 0) { has_assignment = true; break; }
-                    }
-
-                    if (has_assignment) {
-                        // Nested assignment -> parse into a single IRStmt
-                        IR nested_ir;
-                        ir_init(&nested_ir);
-                        if (parse_expression_enhanced(arg_start, arg_len, &nested_ir) == 0 && nested_ir.count > 0) {
-                            IRStmt* nested_stmt = arena_alloc_v2(sizeof(IRStmt));
-                            *nested_stmt = nested_ir.stmts[0];
-                            stmt->args[current_arg] = nested_stmt;
-                        } else {
-                            free(nested_ir.stmts);
-                            stmt->args[current_arg] = NULL;
-                            return -1;
-                        }
-                        free(nested_ir.stmts);
-                    } else if (arg_len >= 2 && arg_start[0] == '"' && arg_end[0] == '"') {
-                        // String literal
-                        char* literal = arena_alloc_v2(arg_len - 1);
-                        strncpy(literal, arg_start + 1, arg_len - 2);
-                        literal[arg_len - 2] = '\0';
-                        stmt->args[current_arg] = literal;
-                    } else if (is_numeric_literal(arg_start, arg_len)) {
-                        // Numeric literal
-                        char temp[arg_len + 1];
-                        strncpy(temp, arg_start, arg_len);
-                        temp[arg_len] = '\0';
-                        long* num = arena_alloc_v2(sizeof(long));
-                        *num = atol(temp);
-                        stmt->args[current_arg] = num;
-                    } else {
-                        // Variable
-                        char simple_var[MAX_NAME_LEN];
-                        if (arg_len < MAX_NAME_LEN) {
-                            strncpy(simple_var, arg_start, arg_len);
-                            simple_var[arg_len] = '\0';
-                            char *s = simple_var;
-                            while (*s && isspace((unsigned char)*s)) s++;
-                            if (s != simple_var) memmove(simple_var, s, strlen(s) + 1);
-                            int idx = var_index(simple_var);
-                            stmt->args[current_arg] = env_array[idx];
-                        } else {
-                            stmt->args[current_arg] = NULL;
-                        }
-                    }
+            // STRICT RULE: All arguments must follow "arg_var = func(...)" pattern
+            const char* eq_pos = NULL;
+            int td = 0;
+            for (const char* q = arg_start; q <= arg_end; ++q) {
+                if (*q == '(') td++;
+                else if (*q == ')') td--;
+                else if (*q == '=' && td == 0) {
+                    eq_pos = q;
+                    break;
                 }
             }
+            
+            if (!eq_pos) {
+                char temp_arg[arg_len + 1];
+                strncpy(temp_arg, arg_start, arg_len);
+                temp_arg[arg_len] = '\0';
+                fprintf(stderr, "Error: Argument must follow 'var = func(...)' pattern: '%s'\n", temp_arg);
+                return -1;
+            }
+
+            // Parse the assignment within the argument
+            const char* arg_var_start = arg_start;
+            const char* arg_var_end = eq_pos - 1;
+            while (arg_var_start <= arg_var_end && isspace((unsigned char)*arg_var_start)) arg_var_start++;
+            while (arg_var_end >= arg_var_start && isspace((unsigned char)*arg_var_end)) arg_var_end--;
+            
+            const char* arg_func_start = eq_pos + 1;
+            while (arg_func_start <= arg_end && isspace((unsigned char)*arg_func_start)) arg_func_start++;
+            
+            int arg_var_len = (arg_var_end >= arg_var_start) ? (int)(arg_var_end - arg_var_start + 1) : 0;
+            int arg_func_len = (arg_end >= arg_func_start) ? (int)(arg_end - arg_func_start + 1) : 0;
+            
+            if (arg_var_len <= 0) {
+                fprintf(stderr, "Error: Missing variable name in argument assignment\n");
+                return -1;
+            }
+            
+            if (arg_func_len <= 0) {
+                fprintf(stderr, "Error: Missing function call in argument assignment\n");
+                return -1;
+            }
+            
+            // Validate that RHS is a function call
+            if (!is_valid_function_call(arg_func_start, arg_func_len)) {
+                char temp_func[arg_func_len + 1];
+                strncpy(temp_func, arg_func_start, arg_func_len);
+                temp_func[arg_func_len] = '\0';
+                fprintf(stderr, "Error: RHS must be a function call, got: '%s'\n", temp_func);
+                return -1;
+            }
+            
+            // Parse as nested assignment
+            IR nested_ir;
+            ir_init(&nested_ir);
+            
+            // Reconstruct the full assignment for parsing
+            int full_assign_len = arg_len;
+            char* full_assign = malloc(full_assign_len + 1);
+            if (!full_assign) {
+                perror("malloc full_assign");
+                return -1;
+            }
+            strncpy(full_assign, arg_start, full_assign_len);
+            full_assign[full_assign_len] = '\0';
+            
+            if (parse_expression_strict(full_assign, full_assign_len, &nested_ir) == 0 && nested_ir.count > 0) {
+                IRStmt* nested_stmt = arena_alloc_v2(sizeof(IRStmt));
+                *nested_stmt = nested_ir.stmts[0];
+                stmt->args[current_arg] = nested_stmt;
+            } else {
+                free(nested_ir.stmts);
+                free(full_assign);
+                return -1;
+            }
+            free(nested_ir.stmts);
+            free(full_assign);
+            
             current_arg++;
             arg_start = p + 1;
         }
@@ -667,8 +713,9 @@ static int parse_enhanced_arguments(const char* args_start, const char* args_end
     return 0;
 }
 
-// Enhanced parse_expression with universal type
-static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_ir) {
+// Strict expression parsing with OPTIVAR validation
+static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir) {
+    // Find the assignment operator
     const char* eq = NULL;
     for (int i = 0; i < expr_len; i++) {
         if (expr[i] == '=') {
@@ -676,66 +723,147 @@ static int parse_expression_enhanced(const char* expr, int expr_len, IR* nested_
             break;
         }
     }
-    if (!eq) return -1;
+    if (!eq) {
+        fprintf(stderr, "Error: Expression must contain assignment operator '='\n");
+        return -1;
+    }
+
+    // Parse LHS (variable name)
     const char* lhs_start = expr;
     const char* lhs_end = eq - 1;
     while (lhs_start < lhs_end && isspace((unsigned char)*lhs_start)) lhs_start++;
     while (lhs_end > lhs_start && isspace((unsigned char)*lhs_end)) lhs_end--;
-    if (lhs_start >= lhs_end) return -1;
+    
+    if (lhs_start >= lhs_end) {
+        fprintf(stderr, "Error: Missing variable name on left side of assignment\n");
+        return -1;
+    }
+    
     int lhs_len = lhs_end - lhs_start + 1;
     char lhs[MAX_NAME_LEN];
-    if (lhs_len >= MAX_NAME_LEN) return -1;
+    if (lhs_len >= MAX_NAME_LEN) {
+        fprintf(stderr, "Error: Variable name too long (max %d characters)\n", MAX_NAME_LEN - 1);
+        return -1;
+    }
     strncpy(lhs, lhs_start, lhs_len);
     lhs[lhs_len] = '\0';
-    const char* rhs = eq + 1;
-    while (isspace((unsigned char)*rhs)) rhs++;
 
-    const char* open_delim = strchr(rhs, '(');
-    if (!open_delim) return -1;
+    // Validate LHS is a valid variable name (no function calls)
+    if (!is_bare_variable(lhs, lhs_len)) {
+        fprintf(stderr, "Error: Left side of assignment must be a simple variable name: '%s'\n", lhs);
+        return -1;
+    }
 
-    /* compute function name (safe) */
+    // Parse RHS
+    const char* rhs_start = eq + 1;
+    while (rhs_start < expr + expr_len && isspace((unsigned char)*rhs_start)) rhs_start++;
+    const char* rhs_end = expr + expr_len - 1;
+    while (rhs_end > rhs_start && isspace((unsigned char)*rhs_end)) rhs_end--;
+    
+    if (rhs_start > rhs_end) {
+        fprintf(stderr, "Error: Missing function call on right side of assignment\n");
+        return -1;
+    }
+    
+    int rhs_len = rhs_end - rhs_start + 1;
+    
+    // STRICT RULE: Check for invalid patterns on RHS
+    
+    // 1. No bare variables (z = x is invalid)
+    if (is_bare_variable(rhs_start, rhs_len)) {
+        char temp_rhs[rhs_len + 1];
+        strncpy(temp_rhs, rhs_start, rhs_len);
+        temp_rhs[rhs_len] = '\0';
+        fprintf(stderr, "Error: Variable-to-variable assignment not allowed: '%s = %s'\n", lhs, temp_rhs);
+        return -1;
+    }
+    
+    // 2. No bare literals (x = 5 is invalid, must be x = equal(5))
+    if (is_bare_literal(rhs_start, rhs_len)) {
+        char temp_rhs[rhs_len + 1];
+        strncpy(temp_rhs, rhs_start, rhs_len);
+        temp_rhs[rhs_len] = '\0';
+        fprintf(stderr, "Error: Bare literals not allowed, must wrap in function: '%s = %s' (try '%s = equal(%s)')\n", 
+                lhs, temp_rhs, lhs, temp_rhs);
+        return -1;
+    }
+    
+    // 3. Must be a valid function call
+    if (!is_valid_function_call(rhs_start, rhs_len)) {
+        char temp_rhs[rhs_len + 1];
+        strncpy(temp_rhs, rhs_start, rhs_len);
+        temp_rhs[rhs_len] = '\0';
+        fprintf(stderr, "Error: Right side must be a function call: '%s'\n", temp_rhs);
+        return -1;
+    }
+
+    // Extract function name
+    const char* open_delim = NULL;
+    for (const char* p = rhs_start; p <= rhs_end; p++) {
+        if (*p == '(') {
+            open_delim = p;
+            break;
+        }
+    }
+    
+    if (!open_delim) {
+        fprintf(stderr, "Error: Invalid function call syntax\n");
+        return -1;
+    }
+    
     const char* fname_end = open_delim - 1;
-    while (fname_end > rhs && isspace((unsigned char)*fname_end)) fname_end--;
-    int fname_len = (int)(fname_end - rhs + 1);
-    if (fname_len <= 0 || fname_len >= MAX_NAME_LEN) return -1;
+    while (fname_end > rhs_start && isspace((unsigned char)*fname_end)) fname_end--;
+    int fname_len = (int)(fname_end - rhs_start + 1);
+    
+    if (fname_len <= 0 || fname_len >= MAX_NAME_LEN) {
+        fprintf(stderr, "Error: Invalid function name length\n");
+        return -1;
+    }
+    
     char fname[MAX_NAME_LEN];
-    memcpy(fname, rhs, fname_len);
+    memcpy(fname, rhs_start, fname_len);
     fname[fname_len] = '\0';
 
-    /* find matching parenthesis */
-    int close_pos = find_matching_delim(rhs, (int)(open_delim - rhs), '(', ')');
-    if (close_pos < 0) return -1;
+    // Find matching parenthesis
+    int close_pos = find_matching_delim(rhs_start, (int)(open_delim - rhs_start), '(', ')');
+    if (close_pos < 0) {
+        fprintf(stderr, "Error: Unmatched parentheses in function call\n");
+        return -1;
+    }
+    
     const char* content_start = open_delim + 1;
-    const char* content_end = rhs + close_pos - 1;
+    const char* content_end = rhs_start + close_pos - 1;
     while (content_start < content_end && isspace((unsigned char)*content_start)) content_start++;
     while (content_end > content_start && isspace((unsigned char)*content_end)) content_end--;
 
+    // Create the statement
     IRStmt* stmt = ir_alloc_stmt(nested_ir);
     stmt->lhs_index = var_index(lhs);
     strncpy(stmt->func_name, fname, MAX_NAME_LEN);
-    if (content_start < content_end) {
-        if (parse_enhanced_arguments(content_start, content_end, stmt) != 0) {
+    
+    // Parse arguments with strict validation
+    if (content_start <= content_end) {
+        if (parse_strict_arguments(content_start, content_end, stmt) != 0) {
             return -1;
         }
     } else {
         stmt->argc = 0;
         stmt->args = NULL;
     }
+    
     return 0;
 }
 
-// Parse line with universal type
-static int parse_line_v3(const char* line, IR* ir, int line_num) {
+// Parse line with strict OPTIVAR validation
+static int parse_line_strict(const char* line, IR* ir, int line_num) {
     int len = strlen(line);
     while (len > 0 && isspace((unsigned char)line[len-1])) len--;
     if (len <= 0) return 0;
     if (line[0] == '-' && line[1] == '-') return 0; // Skip comments
-    if (parse_expression_enhanced(line, len, ir) != 0) {
-        if (strict_mode) {
-            fprintf(stderr, "Parse error at line %d: %s\n", line_num, line);
-            return -1;
-        }
-        return 0;
+    
+    if (parse_expression_strict(line, len, ir) != 0) {
+        fprintf(stderr, "Parse error at line %d: %s\n", line_num, line);
+        return -1;
     }
     return 0;
 }
@@ -782,7 +910,7 @@ static void* execute_statement_block(struct BinContext* ctx, StatementBlock* blo
         void* result = fn(args, stmt->argc, ctx);
         if (lhs && result) {
             lhs->data = result;
-            if (result && is_numeric_literal((char*)result, strlen((char*)result))) {
+            if (result && is_bare_literal((char*)result, strlen((char*)result))) {
                 lhs->value = *(long*)result;
             }
         }
@@ -834,7 +962,7 @@ static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
         void* result = fn(args, stmt->argc, &global_bin_context);
         if (result) {
             lhs->data = result;
-            if (result && is_numeric_literal((char*)result, strlen((char*)result))) {
+            if (result && is_bare_literal((char*)result, strlen((char*)result))) {
                 lhs->value = *(long*)result;
             }
         }
@@ -844,7 +972,7 @@ static void executor_enhanced(IRStmt* stmts, int stmt_count, VarSlot** env) {
 static void cleanup_all() {
     if (env_array) {
         for (int i = 0; i < var_count; ++i)
-            if (env_array[i] && env_array[i].data) free(env_array[i].data);
+            if (env_array[i] && env_array[i]->data) free(env_array[i]->data);
         free(env_array);
         env_array = NULL;
     }
@@ -934,27 +1062,25 @@ static IR* parse_script_file(const char* path) {
         int consumed = 0;
         char *block = read_block(f, &consumed);
         if (!block) break;
-        if (parse_line_v3(block, ir, line_num) == -1) {
-            if (strict_mode) {
-                fprintf(stderr, "Parse error in %s at line %d: %s\n", path, line_num, block);
-                free(block);
-                fclose(f);
-                if (ir->stmts) {
-                    for (int i = 0; i < ir->count; i++) {
-                        if (ir->stmts[i].args) {
-                            for (int j = 0; j < ir->stmts[i].argc; j++) {
-                                if (ir->stmts[i].args[j] && ((StatementBlock*)ir->stmts[i].args[j])->stmts) {
-                                    free(((StatementBlock*)ir->stmts[i].args[j])->stmts);
-                                }
+        if (parse_line_strict(block, ir, line_num) == -1) {
+            fprintf(stderr, "Parse error in %s at line %d: %s\n", path, line_num, block);
+            free(block);
+            fclose(f);
+            if (ir->stmts) {
+                for (int i = 0; i < ir->count; i++) {
+                    if (ir->stmts[i].args) {
+                        for (int j = 0; j < ir->stmts[i].argc; j++) {
+                            if (ir->stmts[i].args[j] && ((StatementBlock*)ir->stmts[i].args[j])->stmts) {
+                                free(((StatementBlock*)ir->stmts[i].args[j])->stmts);
                             }
-                            free(ir->stmts[i].args);
                         }
+                        free(ir->stmts[i].args);
                     }
-                    free(ir->stmts);
                 }
-                free(ir);
-                return NULL;
+                free(ir->stmts);
             }
+            free(ir);
+            return NULL;
         }
         line_num += consumed;
         free(block);
@@ -979,7 +1105,7 @@ static void run_script(const char* path) {
     if (ir->stmts) {
         for (int i = 0; i < ir->count; i++) {
             if (ir->stmts[i].args) {
-                for (int j = 0; i < ir->stmts[i].argc; j++) {
+                for (int j = 0; j < ir->stmts[i].argc; j++) {
                     if (ir->stmts[i].args[j] && ((StatementBlock*)ir->stmts[i].args[j])->stmts) {
                         free(((StatementBlock*)ir->stmts[i].args[j])->stmts);
                     }
@@ -1001,7 +1127,21 @@ char *preload_list = NULL;
 int main(int argc, char **argv) {
     atexit(cleanup_all);
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N] [--preload|--preload=list:bin1,bin2,...] [--strict]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N] [--preload|--preload=list:bin1,bin2,...] [--non-strict]\n", argv[0]);
+        fprintf(stderr, "\nOPTIVAR SYNTAX RULES:\n");
+        fprintf(stderr, "1. Everything is a function call\n");
+        fprintf(stderr, "2. Assignment is always to a function result\n");
+        fprintf(stderr, "3. Nested functions must use assignments for arguments\n");
+        fprintf(stderr, "4. No direct operations outside functions\n");
+        fprintf(stderr, "5. No variable-to-variable assignment\n");
+        fprintf(stderr, "6. Function arguments must follow arg_var = func()\n");
+        fprintf(stderr, "7. Deep nesting is allowed\n");
+        fprintf(stderr, "8. Literals must be wrapped in functions like equal(5)\n");
+        fprintf(stderr, "\nExamples:\n");
+        fprintf(stderr, "  x = equal(5)                    # valid\n");
+        fprintf(stderr, "  y = add(a = equal(2), b = equal(3))  # valid\n");
+        fprintf(stderr, "  z = x                           # invalid\n");
+        fprintf(stderr, "  w = 42                          # invalid\n");
         return 1;
     }
     FIXED_VARS = DEFAULT_FIXED_VARS;
@@ -1024,8 +1164,8 @@ int main(int argc, char **argv) {
             preload_all = 1;
         } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
             preload_list = argv[i] + 15;
-        } else if (strcmp(argv[i], "--strict") == 0) {
-            strict_mode = 1;
+        } else if (strcmp(argv[i], "--non-strict") == 0) {
+            strict_mode = 0;
         } else if (argv[i][0] != '-') {
             script_path = argv[i];
         }
