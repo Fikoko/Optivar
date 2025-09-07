@@ -641,7 +641,7 @@ static int parse_strict_arguments(const char* args_start, const char* args_end, 
                 char temp_arg[arg_len + 1];
                 strncpy(temp_arg, arg_start, arg_len);
                 temp_arg[arg_len] = '\0';
-                fprintf(stderr, "Error: Argument must follow 'var = func(...)' pattern: '%s'\n", temp_arg);
+                fprintf(stderr, "Error: Argument must follow 'var = func(...)' pattern \n", temp_arg);
                 return -1;
             }
 
@@ -774,7 +774,7 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
         char temp_rhs[rhs_len + 1];
         strncpy(temp_rhs, rhs_start, rhs_len);
         temp_rhs[rhs_len] = '\0';
-        fprintf(stderr, "Error: Variable-to-variable assignment not allowed: '%s = %s'\n", lhs, temp_rhs);
+        fprintf(stderr, "Error: Variable-to-variable assignment not allowed \n", lhs, temp_rhs);
         return -1;
     }
     
@@ -783,7 +783,7 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
         char temp_rhs[rhs_len + 1];
         strncpy(temp_rhs, rhs_start, rhs_len);
         temp_rhs[rhs_len] = '\0';
-        fprintf(stderr, "Error: Bare literals not allowed, must wrap in function: '%s = %s' (try '%s = equal(%s)')\n", 
+        fprintf(stderr, "Error: Bare literals not allowed, must wrap in function \n", 
                 lhs, temp_rhs, lhs, temp_rhs);
         return -1;
     }
@@ -793,7 +793,7 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
         char temp_rhs[rhs_len + 1];
         strncpy(temp_rhs, rhs_start, rhs_len);
         temp_rhs[rhs_len] = '\0';
-        fprintf(stderr, "Error: Right side must be a function call: '%s'\n", temp_rhs);
+        fprintf(stderr, "Error: Right side must be a function call \n", temp_rhs);
         return -1;
     }
 
