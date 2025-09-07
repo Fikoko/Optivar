@@ -1128,20 +1128,6 @@ int main(int argc, char **argv) {
     atexit(cleanup_all);
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <script.optivar> [--fixed-vars=N] [--table-size=N] [--preload|--preload=list:bin1,bin2,...] [--non-strict]\n", argv[0]);
-        fprintf(stderr, "\nOPTIVAR SYNTAX RULES:\n");
-        fprintf(stderr, "1. Everything is a function call\n");
-        fprintf(stderr, "2. Assignment is always to a function result\n");
-        fprintf(stderr, "3. Nested functions must use assignments for arguments\n");
-        fprintf(stderr, "4. No direct operations outside functions\n");
-        fprintf(stderr, "5. No variable-to-variable assignment\n");
-        fprintf(stderr, "6. Function arguments must follow arg_var = func()\n");
-        fprintf(stderr, "7. Deep nesting is allowed\n");
-        fprintf(stderr, "8. Literals must be wrapped in functions like equal(5)\n");
-        fprintf(stderr, "\nExamples:\n");
-        fprintf(stderr, "  x = equal(5)                    # valid\n");
-        fprintf(stderr, "  y = add(a = equal(2), b = equal(3))  # valid\n");
-        fprintf(stderr, "  z = x                           # invalid\n");
-        fprintf(stderr, "  w = 42                          # invalid\n");
         return 1;
     }
     FIXED_VARS = DEFAULT_FIXED_VARS;
