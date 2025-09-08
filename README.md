@@ -43,7 +43,7 @@ output = f(input1, input2, input3, ...)
 
 For simplicity, it is translated to natural language as:
 
-"make functional translation f of inputs (variables/arguments) x1, x2 , x3 ... as equivalent of the output (variable/argument) y1"
+"make functional translation f of inputs (variables/arguments/statements) x1, x2 , x3 ... as equivalent of the output (variable/argument/statements) y1"
 
 ## Getting Started
 
