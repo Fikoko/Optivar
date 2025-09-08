@@ -120,7 +120,7 @@ main = do(
 
 This mode is called as "Dynamic" since every statement is splitted line by line approach.
 This enables interpreter to call a each bin at run-time. While it adds some overhead at runtime since interpreter does the
-execution, it enables user to dynamically change the script code at run-time. Since it will be fully dynamic but slower.
+execution, it enables user to dynamically change the script code at run-time.
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
 -- (assuming include.bin and lib.bin exists. Also for this case lib.bin has other functions below in single merged bin)
