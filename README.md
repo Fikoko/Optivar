@@ -97,6 +97,11 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 
 * Example of Code (HPC mode)
 
+This mode is called as "HPC" referenced as (High Performance Computing) since every statement is 
+inside single function as argument. This enables interpreter to call a single function and give the necessary information
+about nested arguments inside to that function. After that, there will be no interpreter overhead since every call will be
+handled as bin-to-bin calls (native speed). 
+
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
 -- (assuming do.bin, include.bin and lib.bin exists. Also for this case "lib.bin" has other functions mentioned below in single merged bin)
@@ -113,6 +118,8 @@ main = do(
 ```
 * Example of Code (Dynamic mode)
 
+This mode is called Dynamic mode since one can change the optivar script code at runtime. This enables code to be fully dynamic 
+by interpreter calling every bin by itself. Losing some overhead at speed will benefit the user to change the code input at runtime.
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
 -- (assuming include.bin and lib.bin exists. Also for this case lib.bin has other functions below in single merged bin)
