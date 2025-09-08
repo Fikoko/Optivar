@@ -1,4 +1,4 @@
-// optivar.c -- Enhanced runtime with string escape handling and universal types
+// optivar.c -- superoptimized, memory-safe, minimal, scalable IR executor with strict syntax 
 // Build: gcc -O3 -march=native -lz -o optivar optivar.c
 
 #define _GNU_SOURCE
@@ -1772,40 +1772,3 @@ int main(int argc, char **argv) {
     run_script_with_escapes(script_path);
     return 0;
 }
-
-/*
-EXAMPLE USAGE WITH ESCAPE SEQUENCES:
-
-Now you can write OPTIVAR scripts with escaped strings like:
-
--- Basic string with escaped quotes
-result = str("He said \"Hello World\"")
-
--- String with escaped equals sign
-equation = str("x \= y + 2")  
-
--- String with escaped parentheses
-brackets = str("This has \( and \) inside")
-
--- String with escaped comma
-list = str("item1\, item2\, item3")
-
--- String with escaped comment
-comment_str = str("This contains \-- not a comment")
-
--- Complex example with multiple escapes
-complex = format(msg = str("Error\: value \= \"invalid\", check \(line 5\)"), 
-                code = num(404))
-
--- All escape sequences supported:
---   \" -> "
---   \\ -> \
---   \= -> =
---   \( -> (
---   \) -> )
---   \, -> ,
---   \-- -> --
---   \n -> newline
---   \t -> tab
---   \r -> carriage return
-*/
