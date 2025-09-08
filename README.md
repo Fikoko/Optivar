@@ -99,7 +99,8 @@ The concept of a declarative, minimalist language for both high-level users and 
 * Example of Code (HPC mode)
 
 This mode is called as "HPC" referenced as (High Performance Computing) since every statement is 
-inside single function as argument. This enables interpreter to call a single bin function (do.bin is an example at below) and give the necessary information about nested arguments inside to that bin. After that, there will be no interpreter overhead since every call will be handled as bin-to-bin calls (native speed). 
+inside single function as argument. This enables interpreter to call a single bin function (do.bin is an example at below) and give the necessary information about nested arguments inside to that bin. After that, there will be no interpreter overhead since every call will be handled as bin-to-bin calls which is native speed. (Important thing here is that
+we assume bin-to-bin calls exists since they are not merged into single bin. We lazy/preload them here assuming they are multiple independent bins)
 
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
@@ -119,7 +120,8 @@ main = do(
 
 This mode is called as "Dynamic" since every statement is splitted line by line approach.
 This enables interpreter to call a each bin at run-time. While it adds some overhead at runtime since interpreter does the
-execution, it enables user to dynamically change the script code at run-time.
+execution, it enables user to dynamically change the script code at run-time. (Important thing here is that
+we assume bin-to-bin calls exists since they are not merged into single bin. We lazy/preload them here assuming they are multiple independent bins)
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
 -- (assuming include.bin and lib.bin exists. Also for this case lib.bin has other functions below in single merged bin)
@@ -132,6 +134,15 @@ execution, it enables user to dynamically change the script code at run-time.
  a = return(b)                                  
 
 ```
+### Questions 
+
+1) Why not just use Asm/C/C++ for static HPC tasks ?
+   
+**At nanosecond (or smaller) scales, execution speed dominates.** Assuming that all bins that will be used as functions are merged
+into one single bin file, the only overhead of Optivar (for HPC case where all statements are arguments of a single function)
+is first interpreter-to-bin call. Meaning it is a **startup speed overhead (one-time event).** Overall execution speed can be equal/faster
+since all bins are planned to be written for hardware infrastructure's assembly programming language and then transformed into bin.
+This allows language like Optivar (which is actually an interpreter) that can race with compilers in HPC tasks.
 
 ## Authors
 Fikret Güney Ersezer
