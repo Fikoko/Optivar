@@ -74,16 +74,17 @@ gcc -O3 -march=native -lz -o optivar optivar.c
 ### Historical Context and Novelty
 The concept of a declarative, minimalist language for both high-level users and low-level optimizers has roots in earlier paradigms but hasn’t been combined in this way:
 
-1960s–1970s: APL and Forth explored minimalism and function-based programming, but not with Optivar’s declarative purity or hardware focus.
+**Early Minimalism**
+1960s–1970s: APL, Forth explored minimal syntax and function-based execution. But they still included built-in operations (arithmetic, stack ops).
 
-1970s–1980s: SQL and Prolog established declarative programming, but they were domain-specific and lacked hardware optimization.
+**Declarative Paradigms**
+1970s–1980s: SQL, Prolog established declarative styles where users described what, not how. But they were domain-specific (databases, logic) and lacked hardware focus.
 
-1990s–2000s: LLVM IR and Haskell advanced optimization and declarative programming, but not with Optivar’s dual audience or extreme simplicity.
+**Optimization Frameworks**
+1990s–2000s: LLVM IR, Haskell advanced compiler optimization and declarative purity. But LLVM defines a fixed instruction set; Haskell is a high-level language, not hardware-aware IR.
 
-Modern Era: Dataflow languages like LabVIEW and domain-specific tools show continued interest in declarative models, but none match Optivar’s general-purpose, hardware-oriented design.
-
-
-Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optimizable nature) and SQL (for its declarative simplicity), but its combination of a declarative frontend, researcher-driven low-level functions, and extreme syntactic minimalism is a fresh approach.
+**Modern Era**
+2000s-today: Dataflow, ML Graphs, LabVIEW, TensorFlow, ONNX emphasize dataflow graphs and modular ops. But they are domain-specific, and still ship with built-in operators.
 
 
 | Feature                                 | Description                                                                    |
