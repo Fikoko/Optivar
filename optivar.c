@@ -16,6 +16,9 @@
 #include <zlib.h>
 #include <limits.h>
 #include <assert.h>
+#include <sys/inotify.h>
+#include <errno.h>
+#include <time.h>
 
 //
 // Tunables
@@ -975,10 +978,18 @@ static int skip_comments_and_whitespace_with_escapes(const char* str, int len, i
 //
 // Enhanced parser with escape support
 //
-static int parse_line_strict_with_escapes(const char* line, IR* ir, int line_num);
-static int parse_expression_strict_with_escapes(const char* expr, int expr_len, IR* nested_ir);
-static int parse_strict_arguments_with_escapes(const char* args_start, const char* args_end, IRStmt* stmt);
-static int parse_inline_block_strict_with_escapes(const char* block_start, const char* block_end, StatementBlock* block);
+static int parse_line_strict_with_escapes(const char* line, IR* ir, int line_num) {
+    int len = strlen(line);
+    while (len > 0 && isspace((unsigned char)line[len-1])) len--;
+    if (len <= 0) return 0;
+    if (is_comment_line_with_escapes(line)) return 0;
+
+    if (parse_expression_strict_with_escapes(line, len, ir) != 0) {
+        fprintf(stderr, "Parse error at line %d: %s\n", line_num, line);
+        return -1;
+    }
+    return 0;
+}
 
 // Helper to find matching delimiter with escape and comment awareness
 static int find_matching_delim_with_escapes(const char* str, int start, char open, char close) {
@@ -1380,8 +1391,51 @@ static int parse_expression_strict_with_escapes(const char* expr, int expr_len, 
     strncpy(stmt->func_name, fname, MAX_NAME_LEN - 1);
     stmt->func_name[MAX_NAME_LEN - 1] = '\0';
     
-    // Parse arguments with strict validation, escape support, and type safety
+    // Check if argument is a block (HPC mode)
+    int arg_start_pos = content_start - expr;
     if (content_start <= content_end) {
+        int* boundaries;
+        int boundary_count;
+        int arg_count = find_argument_boundaries_safe(content_start, content_end - content_start + 1, &boundaries, &boundary_count);
+        
+        // Check if single argument is a block (starts with assignment-like pattern)
+        if (arg_count == 1) {
+            int start_idx = boundaries[0];
+            int end_idx = boundaries[1] - 1;
+            if (start_idx <= end_idx) {
+                const char* arg_start = content_start + start_idx;
+                int arg_len = end_idx - start_idx + 1;
+                // Check if argument resembles a block (contains assignments)
+                bool is_block = false;
+                bool in_string_block = false;
+                bool escaped_block = false;
+                for (int i = 0; i < arg_len; i++) {
+                    char c = arg_start[i];
+                    if (in_string_block) {
+                        if (escaped_block) escaped_block = false;
+                        else if (c == '\\') escaped_block = true;
+                        else if (c == '"') in_string_block = false;
+                    } else {
+                        if (c == '"') in_string_block = true;
+                        else if (c == '=') { is_block = true; break; }
+                    }
+                }
+                if (is_block) {
+                    StatementBlock* block = arena_alloc_unlimited(sizeof(StatementBlock));
+                    block_init(block);
+                    if (parse_inline_block_strict_with_escapes(arg_start, arg_start + arg_len - 1, block) != 0) {
+                        fprintf(stderr, "Error: Failed to parse block argument\n");
+                        return -1;
+                    }
+                    stmt->argc = 1;
+                    stmt->args = arena_alloc_unlimited(sizeof(Value*));
+                    stmt->args[0] = value_create_block(block);
+                    return 0;
+                }
+            }
+        }
+        
+        // Standard argument parsing
         if (parse_strict_arguments_with_escapes(content_start, content_end, stmt) != 0) {
             return -1;
         }
@@ -1390,20 +1444,6 @@ static int parse_expression_strict_with_escapes(const char* expr, int expr_len, 
         stmt->args = NULL;
     }
     
-    return 0;
-}
-
-// Parse line with strict OPTIVAR validation, escape support, and comment support
-static int parse_line_strict_with_escapes(const char* line, IR* ir, int line_num) {
-    int len = strlen(line);
-    while (len > 0 && isspace((unsigned char)line[len-1])) len--;
-    if (len <= 0) return 0;
-    if (is_comment_line_with_escapes(line)) return 0; // Skip comment lines
-    
-    if (parse_expression_strict_with_escapes(line, len, ir) != 0) {
-        fprintf(stderr, "Parse error at line %d: %s\n", line_num, line);
-        return -1;
-    }
     return 0;
 }
 
@@ -1659,11 +1699,31 @@ static IR* parse_script_file_with_escapes(const char* path) {
     IR* ir = arena_alloc_unlimited(sizeof(IR));  // Use arena
     ir_init(ir);
     int line_num = 1;
+    bool is_hpc_mode = false;
     
     while (1) {
         int consumed = 0;
         char *block = read_block_with_comments_and_escapes(f, &consumed);
         if (!block) break;
+        
+        // Check for HPC mode: single statement with block argument
+        if (ir->count == 0) {
+            int pos = 0;
+            skip_comments_and_whitespace_with_escapes(block, strlen(block), &pos);
+            const char* trimmed = block + pos;
+            int trimmed_len = strlen(trimmed);
+            // Look for var = func(...) with block-like content
+            bool has_eq = false, has_paren = false;
+            for (int i = 0; i < trimmed_len; i++) {
+                char c = trimmed[i];
+                if (c == '=') has_eq = true;
+                else if (c == '(') has_paren = true;
+                else if (c == '=' && has_eq && has_paren) {
+                    is_hpc_mode = true; // Likely a block
+                    break;
+                }
+            }
+        }
         
         if (parse_line_strict_with_escapes(block, ir, line_num) == -1) {
             fprintf(stderr, "Parse error in %s at line %d: %s\n", path, line_num, block);
@@ -1671,6 +1731,9 @@ static IR* parse_script_file_with_escapes(const char* path) {
             return NULL;  // Arena cleanup handles memory
         }
         line_num += consumed;
+        
+        // HPC: Stop after first valid statement
+        if (is_hpc_mode && ir->count > 0) break;
     }
     fclose(f);
     
@@ -1682,13 +1745,77 @@ static IR* parse_script_file_with_escapes(const char* path) {
 }
 
 static void run_script_with_escapes(const char* path) {
+    // Initial parse and execute
     IR* ir = parse_script_file_with_escapes(path);
     if (!ir) {
         fprintf(stderr, "Error: failed to parse script %s\n", path);
         return;
     }
+    
+    // Detect HPC mode: single statement with block argument
+    bool is_hpc_mode = (ir->count == 1 && ir->stmts[0].argc == 1 && ir->stmts[0].args && ir->stmts[0].args[0] && ir->stmts[0].args[0]->type == TYPE_BLOCK);
+    
     executor_enhanced(ir->stmts, ir->count, env_array);
-    // No manual cleanup needed - arena handles everything
+    
+    if (is_hpc_mode) {
+        // HPC: Single execution
+        return;
+    }
+    
+    // Dynamic mode: Monitor file changes
+    int fd = inotify_init();
+    if (fd < 0) {
+        // Fallback to polling
+        time_t last_mod = 0;
+        struct stat st;
+        while (1) {
+            if (stat(path, &st) == 0 && st.st_mtime > last_mod) {
+                last_mod = st.st_mtime;
+                // Clear environment
+                for (int i = 0; i < var_count; i++) {
+                    if (env_array[i] && env_array[i]->value) {
+                        value_release(env_array[i]->value);
+                        env_array[i]->value = NULL;
+                    }
+                }
+                // Re-parse and execute
+                IR* new_ir = parse_script_file_with_escapes(path);
+                if (new_ir) {
+                    executor_enhanced(new_ir->stmts, new_ir->count, env_array);
+                }
+            }
+            sleep(1);
+        }
+    } else {
+        int wd = inotify_add_watch(fd, path, IN_MODIFY | IN_CREATE | IN_DELETE);
+        if (wd < 0) {
+            perror("inotify_add_watch");
+            close(fd);
+            return;
+        }
+        
+        while (1) {
+            char buffer[4096];
+            ssize_t len = read(fd, buffer, sizeof(buffer));
+            if (len <= 0) continue;
+            
+            // Clear environment
+            for (int i = 0; i < var_count; i++) {
+                if (env_array[i] && env_array[i]->value) {
+                    value_release(env_array[i]->value);
+                    env_array[i]->value = NULL;
+                }
+            }
+            // Re-parse and execute
+            IR* new_ir = parse_script_file_with_escapes(path);
+            if (new_ir) {
+                executor_enhanced(new_ir->stmts, new_ir->count, env_array);
+            }
+        }
+        
+        inotify_rm_watch(fd, wd);
+        close(fd);
+    }
 }
 
 //
