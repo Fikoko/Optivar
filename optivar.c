@@ -1,4 +1,4 @@
-// optivar.c -- Fixed runtime with safe memory management and universal types
+// optivar.c -- Enhanced runtime with string escape handling and universal types
 // Build: gcc -O3 -march=native -lz -o optivar optivar.c
 
 #define _GNU_SOURCE
@@ -179,6 +179,187 @@ static void arena_free_all() {
 }
 
 //
+// STRING ESCAPE HANDLING SYSTEM
+//
+static char* process_string_escapes(const char* input, int input_len, int* output_len) {
+    if (!input || input_len <= 0) {
+        *output_len = 0;
+        return NULL;
+    }
+    
+    // Allocate worst-case size (input might not have any escapes)
+    char* result = arena_alloc_unlimited(input_len + 1);
+    int result_pos = 0;
+    int i = 0;
+    
+    while (i < input_len) {
+        if (input[i] == '\\' && i + 1 < input_len) {
+            char next_char = input[i + 1];
+            switch (next_char) {
+                case '"':
+                    result[result_pos++] = '"';
+                    break;
+                case '\\':
+                    result[result_pos++] = '\\';
+                    break;
+                case '=':
+                    result[result_pos++] = '=';
+                    break;
+                case '(':
+                    result[result_pos++] = '(';
+                    break;
+                case ')':
+                    result[result_pos++] = ')';
+                    break;
+                case ',':
+                    result[result_pos++] = ',';
+                    break;
+                case '-':
+                    // Handle \-- for comment escape
+                    if (i + 2 < input_len && input[i + 2] == '-') {
+                        result[result_pos++] = '-';
+                        result[result_pos++] = '-';
+                        i++; // Skip extra character
+                    } else {
+                        result[result_pos++] = '-';
+                    }
+                    break;
+                case 'n':
+                    result[result_pos++] = '\n';
+                    break;
+                case 't':
+                    result[result_pos++] = '\t';
+                    break;
+                case 'r':
+                    result[result_pos++] = '\r';
+                    break;
+                default:
+                    // Unknown escape sequence - keep the backslash
+                    result[result_pos++] = '\\';
+                    result[result_pos++] = next_char;
+                    break;
+            }
+            i += 2; // Skip both backslash and escaped character
+        } else {
+            result[result_pos++] = input[i];
+            i++;
+        }
+    }
+    
+    result[result_pos] = '\0';
+    *output_len = result_pos;
+    return result;
+}
+
+// Enhanced string literal detection that handles escapes
+static bool is_string_literal_with_escapes(const char* str, int len, char** processed_content, int* content_len) {
+    if (len < 2 || str[0] != '"' || str[len-1] != '"') {
+        *processed_content = NULL;
+        *content_len = 0;
+        return false;
+    }
+    
+    // Extract content between quotes
+    const char* content_start = str + 1;
+    int raw_content_len = len - 2;
+    
+    // Process escapes in the content
+    *processed_content = process_string_escapes(content_start, raw_content_len, content_len);
+    return true;
+}
+
+// Enhanced numeric literal detection
+static bool is_numeric_literal_safe(const char* str, int len, long* value) {
+    if (len <= 0) return false;
+    
+    int i = 0;
+    bool negative = false;
+    
+    if (str[0] == '-') {
+        negative = true;
+        i++;
+        if (i >= len) return false; // Just a minus sign
+    }
+    
+    // Must have at least one digit
+    if (i >= len || !isdigit((unsigned char)str[i])) return false;
+    
+    long result = 0;
+    for (; i < len; i++) {
+        if (!isdigit((unsigned char)str[i])) return false;
+        
+        // Check for overflow
+        if (result > (LONG_MAX - (str[i] - '0')) / 10) {
+            return false; // Would overflow
+        }
+        
+        result = result * 10 + (str[i] - '0');
+    }
+    
+    *value = negative ? -result : result;
+    return true;
+}
+
+// Safe argument parsing that respects string boundaries with escapes
+static int find_argument_boundaries_safe(const char* args_str, int args_len, int** boundaries, int* arg_count) {
+    *boundaries = arena_alloc_unlimited(sizeof(int) * (args_len + 2)); // Over-allocate
+    *arg_count = 0;
+    
+    int pos = 0;
+    int paren_depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    
+    // Skip leading whitespace
+    while (pos < args_len && isspace((unsigned char)args_str[pos])) pos++;
+    
+    if (pos >= args_len) return 0; // Empty arguments
+    
+    (*boundaries)[(*arg_count)++] = pos; // Start of first argument
+    
+    while (pos < args_len) {
+        char c = args_str[pos];
+        
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '(') {
+                paren_depth++;
+            } else if (c == ')') {
+                paren_depth--;
+            } else if (c == ',' && paren_depth == 0) {
+                // End current argument, start next
+                (*boundaries)[(*arg_count)++] = pos; // End of current arg
+                
+                // Skip whitespace after comma
+                pos++;
+                while (pos < args_len && isspace((unsigned char)args_str[pos])) pos++;
+                
+                if (pos < args_len) {
+                    (*boundaries)[(*arg_count)++] = pos; // Start of next arg
+                }
+                continue;
+            }
+        }
+        pos++;
+    }
+    
+    if (*arg_count % 2 == 1) {
+        (*boundaries)[(*arg_count)++] = args_len; // End of last argument
+    }
+    
+    return *arg_count / 2; // Return number of arguments (each has start and end)
+}
+
+//
 // Safe Value management with reference counting
 //
 static Value* value_create(ValueType type) {
@@ -213,6 +394,38 @@ static Value* value_create_stmt(IRStmt* stmt) {
 static Value* value_create_block(StatementBlock* block) {
     Value* v = value_create(TYPE_BLOCK);
     v->block_val = block;
+    return v;
+}
+
+// Create a literal Value from a string with escape processing
+static Value* value_create_literal(const char* literal_str, int literal_len) {
+    char* processed_content;
+    int content_len;
+    
+    // Try string literal first
+    if (is_string_literal_with_escapes(literal_str, literal_len, &processed_content, &content_len)) {
+        Value* v = value_create(TYPE_STRING);
+        if (processed_content) {
+            v->str_val = arena_alloc_unlimited(content_len + 1);
+            strcpy(v->str_val, processed_content);
+        } else {
+            v->str_val = arena_alloc_unlimited(1);
+            v->str_val[0] = '\0';
+        }
+        return v;
+    }
+    
+    // Try numeric literal
+    long num_value;
+    if (is_numeric_literal_safe(literal_str, literal_len, &num_value)) {
+        return value_create_number(num_value);
+    }
+    
+    // Default to string (variable name or other)
+    Value* v = value_create(TYPE_STRING);
+    v->str_val = arena_alloc_unlimited(literal_len + 1);
+    strncpy(v->str_val, literal_str, literal_len);
+    v->str_val[literal_len] = '\0';
     return v;
 }
 
@@ -570,26 +783,64 @@ static void init_env(int total_vars) {
 }
 
 //
-// STRICT OPTIVAR SYNTAX VALIDATION HELPERS (Unchanged - syntax stays exactly the same)
+// ENHANCED OPTIVAR SYNTAX VALIDATION HELPERS WITH ESCAPE SUPPORT
 //
 
 // Helper to validate that a string represents a valid function call (contains parentheses)
-static bool is_valid_function_call(const char* str, int len) {
+static bool is_valid_function_call_with_escapes(const char* str, int len) {
     if (len <= 2) return false; // Must have at least "f()"
     
-    // Find opening parenthesis
+    // Find opening parenthesis (outside of strings)
     const char* open_paren = NULL;
+    bool in_string = false;
+    bool escaped = false;
+    
     for (int i = 0; i < len; i++) {
-        if (str[i] == '(') {
-            open_paren = str + i;
-            break;
+        char c = str[i];
+        
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '(') {
+                open_paren = str + i;
+                break;
+            }
         }
     }
     
     if (!open_paren || open_paren == str) return false; // No paren or starts with paren
     
-    // Must end with closing parenthesis
-    if (str[len - 1] != ')') return false;
+    // Must end with closing parenthesis (outside strings)
+    in_string = false;
+    escaped = false;
+    bool found_close = false;
+    
+    for (int i = len - 1; i >= 0; i--) {
+        char c = str[i];
+        
+        if (in_string) {
+            if (c == '"' && (i == 0 || str[i-1] != '\\')) {
+                in_string = false;
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+            } else if (c == ')') {
+                found_close = true;
+                break;
+            }
+        }
+    }
+    
+    if (!found_close) return false;
     
     // Validate function name (before opening paren)
     for (const char* p = str; p < open_paren; p++) {
@@ -599,56 +850,122 @@ static bool is_valid_function_call(const char* str, int len) {
     return true;
 }
 
-// Helper to check if a string is a bare variable name (no function call)
-static bool is_bare_variable(const char* str, int len) {
+// Helper to check if a string is a bare variable name (no function call) with escape awareness
+static bool is_bare_variable_with_escapes(const char* str, int len) {
     if (len <= 0) return false;
+    
+    bool in_string = false;
+    bool escaped = false;
     
     // Check if it's a valid identifier without parentheses
     for (int i = 0; i < len; i++) {
         char c = str[i];
-        if (c == '(' || c == ')') return false; // Has parentheses, so it's a function call
-        if (!isalnum((unsigned char)c) && c != '_') return false; // Invalid identifier char
+        
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '(' || c == ')') {
+                return false; // Has parentheses, so it's a function call
+            } else if (!isalnum((unsigned char)c) && c != '_') {
+                return false; // Invalid identifier char
+            }
+        }
     }
     return true;
 }
 
-// Helper to check if a string is a bare literal (number or string)
-static bool is_bare_literal(const char* str, int len) {
+// Helper to check if a string is a bare literal (number or string) with escape support
+static bool is_bare_literal_with_escapes(const char* str, int len) {
     if (len <= 0) return false;
     
-    // Check for string literal
-    if (len >= 2 && str[0] == '"' && str[len-1] == '"') {
+    // Check for string literal with proper escape handling
+    char* processed_content;
+    int content_len;
+    if (is_string_literal_with_escapes(str, len, &processed_content, &content_len)) {
         return true;
     }
     
     // Check for numeric literal
-    int i = 0;
-    if (str[0] == '-') i++; // Allow negative numbers
-    for (; i < len; i++) {
-        if (!isdigit((unsigned char)str[i])) return false;
+    long dummy;
+    return is_numeric_literal_safe(str, len, &dummy);
+}
+
+// Enhanced comment-aware parsing helpers with escape support
+static bool is_comment_line_with_escapes(const char* str) {
+    bool in_string = false;
+    bool escaped = false;
+    
+    for (const char* p = str; *p; p++) {
+        char c = *p;
+        
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+            } else if (isspace((unsigned char)c)) {
+                continue; // Skip whitespace
+            } else if (c == '-' && *(p+1) == '-') {
+                return true; // Found comment outside string
+            } else {
+                return false; // Found non-comment content
+            }
+        }
     }
-    return i > (str[0] == '-' ? 1 : 0); // Must have at least one digit
+    return false;
 }
 
-// Enhanced comment-aware parsing helpers
-static bool is_comment_line(const char* str) {
-    while (*str && isspace((unsigned char)*str)) str++;
-    return str[0] == '/' && str[1] == '/';
-}
-
-static int skip_comments_and_whitespace(const char* str, int len, int* pos) {
+static int skip_comments_and_whitespace_with_escapes(const char* str, int len, int* pos) {
     while (*pos < len) {
         char c = str[*pos];
         if (isspace((unsigned char)c)) {
             (*pos)++;
             continue;
         }
-        // Check for // comments
-        if (*pos < len - 1 && c == '/' && str[*pos + 1] == '/') {
-            // Skip to end of line or string
-            while (*pos < len && str[*pos] != '\n') (*pos)++;
-            if (*pos < len) (*pos)++; // Skip newline
-            continue;
+        
+        // Check for -- comments (but not inside strings)
+        if (*pos < len - 1 && c == '-' && str[*pos + 1] == '-') {
+            // Verify we're not inside a string
+            bool in_string = false;
+            bool escaped = false;
+            
+            for (int i = 0; i < *pos; i++) {
+                char prev_c = str[i];
+                if (in_string) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (prev_c == '\\') {
+                        escaped = true;
+                    } else if (prev_c == '"') {
+                        in_string = false;
+                    }
+                } else {
+                    if (prev_c == '"') {
+                        in_string = true;
+                    }
+                }
+            }
+            
+            if (!in_string) {
+                // Skip to end of line or string
+                while (*pos < len && str[*pos] != '\n') (*pos)++;
+                if (*pos < len) (*pos)++; // Skip newline
+                continue;
+            }
         }
         break;
     }
@@ -656,235 +973,264 @@ static int skip_comments_and_whitespace(const char* str, int len, int* pos) {
 }
 
 //
-// Enhanced parser with comment support but same strict OPTIVAR syntax
+// Enhanced parser with escape support
 //
-static int parse_line_strict(const char* line, IR* ir, int line_num);
-static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir);
-static int parse_strict_arguments(const char* args_start, const char* args_end, IRStmt* stmt);
-static int parse_inline_block_strict(const char* block_start, const char* block_end, StatementBlock* block);
+static int parse_line_strict_with_escapes(const char* line, IR* ir, int line_num);
+static int parse_expression_strict_with_escapes(const char* expr, int expr_len, IR* nested_ir);
+static int parse_strict_arguments_with_escapes(const char* args_start, const char* args_end, IRStmt* stmt);
+static int parse_inline_block_strict_with_escapes(const char* block_start, const char* block_end, StatementBlock* block);
 
-// Helper to find matching delimiter with comment awareness
-static int find_matching_delim(const char* str, int start, char open, char close) {
+// Helper to find matching delimiter with escape and comment awareness
+static int find_matching_delim_with_escapes(const char* str, int start, char open, char close) {
     int delim_count = 1;
     int pos = start + 1;
+    bool in_string = false;
+    bool escaped = false;
+    
     while (pos < strlen(str) && delim_count > 0) {
-        // Skip comments inside parentheses
-        if (!skip_comments_and_whitespace(str, strlen(str), &pos)) break;
-        if (pos >= strlen(str)) break;
+        char c = str[pos];
         
-        if (str[pos] == open) delim_count++;
-        else if (str[pos] == close) delim_count--;
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            // Skip comments
+            if (!skip_comments_and_whitespace_with_escapes(str, strlen(str), &pos)) break;
+            if (pos >= strlen(str)) break;
+            
+            c = str[pos];
+            if (c == '"') {
+                in_string = true;
+            } else if (c == open) {
+                delim_count++;
+            } else if (c == close) {
+                delim_count--;
+            }
+        }
         pos++;
     }
     return (delim_count == 0) ? pos - 1 : -1;
 }
 
-// Parse inline block with comment support
-static int parse_inline_block_strict(const char* block_start, const char* block_end, StatementBlock* block) {
+// Parse inline block with escape and comment support
+static int parse_inline_block_strict_with_escapes(const char* block_start, const char* block_end, StatementBlock* block) {
     block_init(block);
-
-    // Count statements by top-level commas (paren-aware, comment-aware)
-    int stmt_count = 0;
-    int paren_depth = 0;
-    int pos = 0;
     int block_len = block_end - block_start + 1;
+
+    // Use safe boundary detection
+    int* boundaries;
+    int boundary_count;
+    int arg_count = find_argument_boundaries_safe(block_start, block_len, &boundaries, &boundary_count);
     
-    while (pos < block_len) {
-        if (!skip_comments_and_whitespace(block_start, block_len, &pos)) break;
-        if (pos >= block_len) break;
+    // Parse each statement
+    for (int i = 0; i < arg_count; i++) {
+        int start_idx = boundaries[i * 2];
+        int end_idx = boundaries[i * 2 + 1] - 1;
         
-        char c = block_start[pos];
-        if (c == '(') paren_depth++;
-        else if (c == ')') paren_depth--;
-        else if (c == ',' && paren_depth == 0) stmt_count++;
-        pos++;
-    }
-    if (block_start <= block_end) stmt_count++;
-
-    // Parse each statement with comment awareness
-    const char* stmt_start = block_start;
-    paren_depth = 0;
-    pos = 0;
-    
-    while (pos <= block_len) {
-        if (!skip_comments_and_whitespace(block_start, block_len + 1, &pos) || 
-            pos > block_len || 
-            (block_start[pos] == ',' && paren_depth == 0)) {
+        if (start_idx <= end_idx) {
+            const char* stmt_start = block_start + start_idx;
+            int stmt_len = end_idx - start_idx + 1;
             
-            const char* stmt_end = (pos > block_len) ? block_end : block_start + pos - 1;
+            // Skip empty statements
+            while (stmt_len > 0 && isspace((unsigned char)*stmt_start)) {
+                stmt_start++;
+                stmt_len--;
+            }
+            while (stmt_len > 0 && isspace((unsigned char)stmt_start[stmt_len-1])) {
+                stmt_len--;
+            }
             
-            // Clean up statement bounds
-            while (stmt_start <= stmt_end && isspace((unsigned char)*stmt_start)) stmt_start++;
-            while (stmt_end >= stmt_start && isspace((unsigned char)*stmt_end)) stmt_end--;
-            int stmt_len = (stmt_end >= stmt_start) ? (int)(stmt_end - stmt_start + 1) : 0;
-
             if (stmt_len > 0) {
                 IR nested_ir;
                 ir_init(&nested_ir);
-                if (parse_expression_strict(stmt_start, stmt_len, &nested_ir) == 0 && nested_ir.count > 0) {
+                if (parse_expression_strict_with_escapes(stmt_start, stmt_len, &nested_ir) == 0 && nested_ir.count > 0) {
                     IRStmt* block_stmt = block_alloc_stmt(block);
                     *block_stmt = nested_ir.stmts[0];
                 } else {
                     return -1;
                 }
             }
-            stmt_start = block_start + pos + 1;
-        }
-        
-        if (pos <= block_len) {
-            char c = block_start[pos];
-            if (c == '(') paren_depth++;
-            else if (c == ')') paren_depth--;
-            pos++;
         }
     }
     return block->count > 0 ? 0 : -1;
 }
 
-// Safe argument parsing with type safety
-static int parse_strict_arguments(const char* args_start, const char* args_end, IRStmt* stmt) {
-    // Count arguments by top-level commas with comment awareness
-    int arg_count = 0;
-    int paren_depth = 0;
-    int pos = 0;
+// Safe argument parsing with escape support and type safety
+static int parse_strict_arguments_with_escapes(const char* args_start, const char* args_end, IRStmt* stmt) {
     int args_len = args_end - args_start + 1;
     
-    while (pos < args_len) {
-        if (!skip_comments_and_whitespace(args_start, args_len, &pos)) break;
-        if (pos >= args_len) break;
-        
-        char c = args_start[pos];
-        if (c == '(') paren_depth++;
-        else if (c == ')') paren_depth--;
-        else if (c == ',' && paren_depth == 0) arg_count++;
-        pos++;
-    }
-    if (args_start <= args_end) arg_count++;
-
+    // Use safe boundary detection
+    int* boundaries;
+    int boundary_count;
+    int arg_count = find_argument_boundaries_safe(args_start, args_len, &boundaries, &boundary_count);
+    
     // Allocate args array with proper type safety
     stmt->argc = arg_count;
-    stmt->args = arena_alloc_unlimited(sizeof(Value*) * arg_count);
+    if (arg_count > 0) {
+        stmt->args = arena_alloc_unlimited(sizeof(Value*) * arg_count);
+    } else {
+        stmt->args = NULL;
+        return 0;
+    }
 
-    // Parse each argument with comment support
-    int current_arg = 0;
-    paren_depth = 0;
-    pos = 0;
-    const char* arg_start = args_start;
-    
-    while (pos <= args_len) {
-        if (!skip_comments_and_whitespace(args_start, args_len + 1, &pos) || 
-            pos > args_len || 
-            (args_start[pos] == ',' && paren_depth == 0)) {
+    // Parse each argument
+    for (int i = 0; i < arg_count; i++) {
+        int start_idx = boundaries[i * 2];
+        int end_idx = boundaries[i * 2 + 1] - 1;
+        
+        if (start_idx > end_idx) {
+            fprintf(stderr, "Error: Empty argument not allowed in strict OPTIVAR mode\n");
+            return -1;
+        }
+        
+        const char* arg_start = args_start + start_idx;
+        int arg_len = end_idx - start_idx + 1;
+        
+        // Skip whitespace
+        while (arg_len > 0 && isspace((unsigned char)*arg_start)) {
+            arg_start++;
+            arg_len--;
+        }
+        while (arg_len > 0 && isspace((unsigned char)arg_start[arg_len-1])) {
+            arg_len--;
+        }
+        
+        if (arg_len <= 0) {
+            fprintf(stderr, "Error: Empty argument not allowed in strict OPTIVAR mode\n");
+            return -1;
+        }
+
+        // STRICT RULE: All arguments must follow "arg_var = func(...)" pattern
+        const char* eq_pos = NULL;
+        bool in_string = false;
+        bool escaped = false;
+        int paren_depth = 0;
+        
+        for (int j = 0; j < arg_len; j++) {
+            char c = arg_start[j];
             
-            const char* arg_end = (pos > args_len) ? args_end : args_start + pos - 1;
-            while (arg_start <= arg_end && isspace((unsigned char)*arg_start)) arg_start++;
-            while (arg_end >= arg_start && isspace((unsigned char)*arg_end)) arg_end--;
-            int arg_len = (arg_end >= arg_start) ? (int)(arg_end - arg_start + 1) : 0;
-
-            if (arg_len <= 0) {
-                fprintf(stderr, "Error: Empty argument not allowed in strict OPTIVAR mode\n");
-                return -1;
-            }
-
-            // STRICT RULE: All arguments must follow "arg_var = func(...)" pattern
-            const char* eq_pos = NULL;
-            int td = 0;
-            for (const char* q = arg_start; q <= arg_end; ++q) {
-                if (*q == '(') td++;
-                else if (*q == ')') td--;
-                else if (*q == '=' && td == 0) {
-                    eq_pos = q;
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+            } else {
+                if (c == '"') {
+                    in_string = true;
+                } else if (c == '(') {
+                    paren_depth++;
+                } else if (c == ')') {
+                    paren_depth--;
+                } else if (c == '=' && paren_depth == 0) {
+                    eq_pos = arg_start + j;
                     break;
                 }
             }
-            
-            if (!eq_pos) {
-                char temp_arg[arg_len + 1];
-                strncpy(temp_arg, arg_start, arg_len);
-                temp_arg[arg_len] = '\0';
-                fprintf(stderr, "Error: Argument must follow 'var = func(...)' pattern: '%s'\n", temp_arg);
-                return -1;
-            }
-
-            // Parse the assignment within the argument
-            const char* arg_var_start = arg_start;
-            const char* arg_var_end = eq_pos - 1;
-            while (arg_var_start <= arg_var_end && isspace((unsigned char)*arg_var_start)) arg_var_start++;
-            while (arg_var_end >= arg_var_start && isspace((unsigned char)*arg_var_end)) arg_var_end--;
-            
-            const char* arg_func_start = eq_pos + 1;
-            while (arg_func_start <= arg_end && isspace((unsigned char)*arg_func_start)) arg_func_start++;
-            
-            int arg_var_len = (arg_var_end >= arg_var_start) ? (int)(arg_var_end - arg_var_start + 1) : 0;
-            int arg_func_len = (arg_end >= arg_func_start) ? (int)(arg_end - arg_func_start + 1) : 0;
-            
-            if (arg_var_len <= 0) {
-                fprintf(stderr, "Error: Missing variable name in argument assignment\n");
-                return -1;
-            }
-            
-            if (arg_func_len <= 0) {
-                fprintf(stderr, "Error: Missing function call in argument assignment\n");
-                return -1;
-            }
-            
-            // Validate that RHS is a function call
-            if (!is_valid_function_call(arg_func_start, arg_func_len)) {
-                char temp_func[arg_func_len + 1];
-                strncpy(temp_func, arg_func_start, arg_func_len);
-                temp_func[arg_func_len] = '\0';
-                fprintf(stderr, "Error: RHS must be a function call, got: '%s'\n", temp_func);
-                return -1;
-            }
-            
-            // Parse as nested assignment with safe allocation
-            IR nested_ir;
-            ir_init(&nested_ir);
-            
-            // Reconstruct the full assignment for parsing
-            int full_assign_len = arg_len;
-            char* full_assign = arena_alloc_unlimited(full_assign_len + 1);
-            strncpy(full_assign, arg_start, full_assign_len);
-            full_assign[full_assign_len] = '\0';
-            
-            if (parse_expression_strict(full_assign, full_assign_len, &nested_ir) == 0 && nested_ir.count > 0) {
-                IRStmt* nested_stmt = arena_alloc_unlimited(sizeof(IRStmt));
-                *nested_stmt = nested_ir.stmts[0];
-                stmt->args[current_arg] = value_create_stmt(nested_stmt);
-            } else {
-                return -1;
-            }
-            
-            current_arg++;
-            arg_start = args_start + pos + 1;
         }
         
-        if (pos <= args_len) {
-            char c = args_start[pos];
-            if (c == '(') paren_depth++;
-            else if (c == ')') paren_depth--;
-            pos++;
+        if (!eq_pos) {
+            char temp_arg[arg_len + 1];
+            strncpy(temp_arg, arg_start, arg_len);
+            temp_arg[arg_len] = '\0';
+            fprintf(stderr, "Error: Argument must follow 'var = func(...)' pattern: '%s'\n", temp_arg);
+            return -1;
+        }
+
+        // Parse the assignment within the argument
+        const char* arg_var_start = arg_start;
+        const char* arg_var_end = eq_pos - 1;
+        while (arg_var_start <= arg_var_end && isspace((unsigned char)*arg_var_start)) arg_var_start++;
+        while (arg_var_end >= arg_var_start && isspace((unsigned char)*arg_var_end)) arg_var_end--;
+        
+        const char* arg_func_start = eq_pos + 1;
+        const char* arg_func_end = arg_start + arg_len - 1;
+        while (arg_func_start <= arg_func_end && isspace((unsigned char)*arg_func_start)) arg_func_start++;
+        while (arg_func_end >= arg_func_start && isspace((unsigned char)*arg_func_end)) arg_func_end--;
+        
+        int arg_var_len = (arg_var_end >= arg_var_start) ? (int)(arg_var_end - arg_var_start + 1) : 0;
+        int arg_func_len = (arg_func_end >= arg_func_start) ? (int)(arg_func_end - arg_func_start + 1) : 0;
+        
+        if (arg_var_len <= 0) {
+            fprintf(stderr, "Error: Missing variable name in argument assignment\n");
+            return -1;
+        }
+        
+        if (arg_func_len <= 0) {
+            fprintf(stderr, "Error: Missing function call in argument assignment\n");
+            return -1;
+        }
+        
+        // Validate that RHS is a function call with escape support
+        if (!is_valid_function_call_with_escapes(arg_func_start, arg_func_len)) {
+            char temp_func[arg_func_len + 1];
+            strncpy(temp_func, arg_func_start, arg_func_len);
+            temp_func[arg_func_len] = '\0';
+            fprintf(stderr, "Error: RHS must be a function call, got: '%s'\n", temp_func);
+            return -1;
+        }
+        
+        // Parse as nested assignment with safe allocation
+        IR nested_ir;
+        ir_init(&nested_ir);
+        
+        // Reconstruct the full assignment for parsing
+        char* full_assign = arena_alloc_unlimited(arg_len + 1);
+        strncpy(full_assign, arg_start, arg_len);
+        full_assign[arg_len] = '\0';
+        
+        if (parse_expression_strict_with_escapes(full_assign, arg_len, &nested_ir) == 0 && nested_ir.count > 0) {
+            IRStmt* nested_stmt = arena_alloc_unlimited(sizeof(IRStmt));
+            *nested_stmt = nested_ir.stmts[0];
+            stmt->args[i] = value_create_stmt(nested_stmt);
+        } else {
+            return -1;
         }
     }
     return 0;
 }
 
-// Strict expression parsing with type safety and comment support
-static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir) {
+// Strict expression parsing with escape support and type safety
+static int parse_expression_strict_with_escapes(const char* expr, int expr_len, IR* nested_ir) {
     // Skip comments at the beginning
     int pos = 0;
-    if (!skip_comments_and_whitespace(expr, expr_len, &pos)) {
+    if (!skip_comments_and_whitespace_with_escapes(expr, expr_len, &pos)) {
         return -1; // Empty expression after removing comments
     }
     
-    // Find the assignment operator
+    // Find the assignment operator (outside strings)
     const char* eq = NULL;
+    bool in_string = false;
+    bool escaped = false;
+    
     for (int i = pos; i < expr_len; i++) {
-        if (expr[i] == '=') {
-            eq = expr + i;
-            break;
+        char c = expr[i];
+        
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '=') {
+                eq = expr + i;
+                break;
+            }
         }
     }
+    
     if (!eq) {
         fprintf(stderr, "Error: Expression must contain assignment operator '='\n");
         return -1;
@@ -911,16 +1257,16 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
     strncpy(lhs, lhs_start, lhs_len);
     lhs[lhs_len] = '\0';
 
-    // Validate LHS is a valid variable name (no function calls)
-    if (!is_bare_variable(lhs, lhs_len)) {
+    // Validate LHS is a valid variable name (no function calls) with escape support
+    if (!is_bare_variable_with_escapes(lhs, lhs_len)) {
         fprintf(stderr, "Error: Left side of assignment must be a simple variable name: '%s'\n", lhs);
         return -1;
     }
 
-    // Parse RHS with comment awareness
+    // Parse RHS with escape and comment awareness
     const char* rhs_start = eq + 1;
     pos = rhs_start - expr;
-    if (!skip_comments_and_whitespace(expr, expr_len, &pos)) {
+    if (!skip_comments_and_whitespace_with_escapes(expr, expr_len, &pos)) {
         fprintf(stderr, "Error: Missing function call on right side of assignment\n");
         return -1;
     }
@@ -936,10 +1282,10 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
     
     int rhs_len = rhs_end - rhs_start + 1;
     
-    // STRICT RULE: Check for invalid patterns on RHS
+    // STRICT RULE: Check for invalid patterns on RHS with escape support
     
     // 1. No bare variables (z = x is invalid)
-    if (is_bare_variable(rhs_start, rhs_len)) {
+    if (is_bare_variable_with_escapes(rhs_start, rhs_len)) {
         char temp_rhs[rhs_len + 1];
         strncpy(temp_rhs, rhs_start, rhs_len);
         temp_rhs[rhs_len] = '\0';
@@ -947,8 +1293,8 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
         return -1;
     }
     
-    // 2. No bare literals (x = 5 is invalid, must be x = equal(5))
-    if (is_bare_literal(rhs_start, rhs_len)) {
+    // 2. No bare literals with escape support (x = "string with \"quotes\"" is invalid, must be x = equal("string with \"quotes\""))
+    if (is_bare_literal_with_escapes(rhs_start, rhs_len)) {
         char temp_rhs[rhs_len + 1];
         strncpy(temp_rhs, rhs_start, rhs_len);
         temp_rhs[rhs_len] = '\0';
@@ -957,8 +1303,8 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
         return -1;
     }
     
-    // 3. Must be a valid function call
-    if (!is_valid_function_call(rhs_start, rhs_len)) {
+    // 3. Must be a valid function call with escape support
+    if (!is_valid_function_call_with_escapes(rhs_start, rhs_len)) {
         char temp_rhs[rhs_len + 1];
         strncpy(temp_rhs, rhs_start, rhs_len);
         temp_rhs[rhs_len] = '\0';
@@ -966,12 +1312,29 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
         return -1;
     }
 
-    // Extract function name
+    // Extract function name (outside strings)
     const char* open_delim = NULL;
+    in_string = false;
+    escaped = false;
+    
     for (const char* p = rhs_start; p <= rhs_end; p++) {
-        if (*p == '(') {
-            open_delim = p;
-            break;
+        char c = *p;
+        
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '(') {
+                open_delim = p;
+                break;
+            }
         }
     }
     
@@ -993,8 +1356,8 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
     memcpy(fname, rhs_start, fname_len);
     fname[fname_len] = '\0';
 
-    // Find matching parenthesis with comment awareness
-    int close_pos = find_matching_delim(rhs_start, (int)(open_delim - rhs_start), '(', ')');
+    // Find matching parenthesis with escape and comment awareness
+    int close_pos = find_matching_delim_with_escapes(rhs_start, (int)(open_delim - rhs_start), '(', ')');
     if (close_pos < 0) {
         fprintf(stderr, "Error: Unmatched parentheses in function call\n");
         return -1;
@@ -1005,7 +1368,7 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
     
     // Skip comments in function arguments
     pos = content_start - rhs_start;
-    if (skip_comments_and_whitespace(rhs_start, close_pos, &pos)) {
+    if (skip_comments_and_whitespace_with_escapes(rhs_start, close_pos, &pos)) {
         content_start = rhs_start + pos;
     }
     
@@ -1017,9 +1380,9 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
     strncpy(stmt->func_name, fname, MAX_NAME_LEN - 1);
     stmt->func_name[MAX_NAME_LEN - 1] = '\0';
     
-    // Parse arguments with strict validation and type safety
+    // Parse arguments with strict validation, escape support, and type safety
     if (content_start <= content_end) {
-        if (parse_strict_arguments(content_start, content_end, stmt) != 0) {
+        if (parse_strict_arguments_with_escapes(content_start, content_end, stmt) != 0) {
             return -1;
         }
     } else {
@@ -1030,21 +1393,21 @@ static int parse_expression_strict(const char* expr, int expr_len, IR* nested_ir
     return 0;
 }
 
-// Parse line with strict OPTIVAR validation and comment support
-static int parse_line_strict(const char* line, IR* ir, int line_num) {
+// Parse line with strict OPTIVAR validation, escape support, and comment support
+static int parse_line_strict_with_escapes(const char* line, IR* ir, int line_num) {
     int len = strlen(line);
     while (len > 0 && isspace((unsigned char)line[len-1])) len--;
     if (len <= 0) return 0;
-    if (is_comment_line(line)) return 0; // Skip comment lines
+    if (is_comment_line_with_escapes(line)) return 0; // Skip comment lines
     
-    if (parse_expression_strict(line, len, ir) != 0) {
+    if (parse_expression_strict_with_escapes(line, len, ir) != 0) {
         fprintf(stderr, "Parse error at line %d: %s\n", line_num, line);
         return -1;
     }
     return 0;
 }
 
-// Enhanced executor with universal type safety
+// Enhanced executor with universal type safety (unchanged)
 static BinContext global_bin_context;
 
 static Value* execute_statement_block(struct BinContext* ctx, StatementBlock* block) {
@@ -1206,7 +1569,7 @@ static void cleanup_all() {
     fixed_top = 0;
 }
 
-static char* read_block_with_comments(FILE* f, int *out_lines_read) {
+static char* read_block_with_comments_and_escapes(FILE* f, int *out_lines_read) {
     char *line = NULL;
     size_t lcap = 0;
     ssize_t r;
@@ -1220,8 +1583,8 @@ static char* read_block_with_comments(FILE* f, int *out_lines_read) {
     while ((r = getline(&line, &lcap, f)) != -1) {
         lines++;
         
-        // Skip pure comment lines
-        if (is_comment_line(line)) {
+        // Skip pure comment lines with escape awareness
+        if (is_comment_line_with_escapes(line)) {
             continue;
         }
         
@@ -1235,11 +1598,26 @@ static char* read_block_with_comments(FILE* f, int *out_lines_read) {
         buflen += (size_t)r;
         buf[buflen] = '\0';
         
-        // Count parentheses, ignoring comments
+        // Count parentheses with escape awareness, ignoring comments
         bool in_comment = false;
+        bool in_string = false;
+        bool escaped = false;
+        
         for (ssize_t i = 0; i < r; ++i) {
             char c = line[i];
-            if (!in_comment && i < r - 1 && c == '/' && line[i+1] == '/') {
+            
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            
+            if (!in_comment && i < r - 1 && c == '-' && line[i+1] == '-') {
                 in_comment = true;
                 i++; // Skip next char
                 continue;
@@ -1249,9 +1627,15 @@ static char* read_block_with_comments(FILE* f, int *out_lines_read) {
                 continue;
             }
             if (!in_comment) {
-                if (c == '(') depth++;
-                else if (c == ')') depth--;
-                else if (c == '=') have_eq = 1;
+                if (c == '"') {
+                    in_string = true;
+                } else if (c == '(') {
+                    depth++;
+                } else if (c == ')') {
+                    depth--;
+                } else if (c == '=') {
+                    have_eq = 1;
+                }
             }
         }
         if (depth <= 0 && have_eq) break;
@@ -1263,9 +1647,9 @@ static char* read_block_with_comments(FILE* f, int *out_lines_read) {
 }
 
 //
-// Script parsing and execution with enhanced safety
+// Script parsing and execution with enhanced escape safety
 //
-static IR* parse_script_file(const char* path) {
+static IR* parse_script_file_with_escapes(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) {
         perror("fopen script");
@@ -1278,10 +1662,10 @@ static IR* parse_script_file(const char* path) {
     
     while (1) {
         int consumed = 0;
-        char *block = read_block_with_comments(f, &consumed);
+        char *block = read_block_with_comments_and_escapes(f, &consumed);
         if (!block) break;
         
-        if (parse_line_strict(block, ir, line_num) == -1) {
+        if (parse_line_strict_with_escapes(block, ir, line_num) == -1) {
             fprintf(stderr, "Parse error in %s at line %d: %s\n", path, line_num, block);
             fclose(f);
             return NULL;  // Arena cleanup handles memory
@@ -1297,8 +1681,8 @@ static IR* parse_script_file(const char* path) {
     return ir;
 }
 
-static void run_script(const char* path) {
-    IR* ir = parse_script_file(path);
+static void run_script_with_escapes(const char* path) {
+    IR* ir = parse_script_file_with_escapes(path);
     if (!ir) {
         fprintf(stderr, "Error: failed to parse script %s\n", path);
         return;
@@ -1308,7 +1692,7 @@ static void run_script(const char* path) {
 }
 
 //
-// main
+// main - Enhanced with escape support
 //
 int preload_all = 0;
 char *preload_list = NULL;
@@ -1385,6 +1769,43 @@ int main(int argc, char **argv) {
         }
     }
     
-    run_script(script_path);
+    run_script_with_escapes(script_path);
     return 0;
 }
+
+/*
+EXAMPLE USAGE WITH ESCAPE SEQUENCES:
+
+Now you can write OPTIVAR scripts with escaped strings like:
+
+-- Basic string with escaped quotes
+result = str("He said \"Hello World\"")
+
+-- String with escaped equals sign
+equation = str("x \= y + 2")  
+
+-- String with escaped parentheses
+brackets = str("This has \( and \) inside")
+
+-- String with escaped comma
+list = str("item1\, item2\, item3")
+
+-- String with escaped comment
+comment_str = str("This contains \-- not a comment")
+
+-- Complex example with multiple escapes
+complex = format(msg = str("Error\: value \= \"invalid\", check \(line 5\)"), 
+                code = num(404))
+
+-- All escape sequences supported:
+--   \" -> "
+--   \\ -> \
+--   \= -> =
+--   \( -> (
+--   \) -> )
+--   \, -> ,
+--   \-- -> --
+--   \n -> newline
+--   \t -> tab
+--   \r -> carriage return
+*/
