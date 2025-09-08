@@ -98,9 +98,7 @@ Optivar’s closest predecessors are likely LLVM IR (for its intermediate, optim
 * Example of Code (HPC mode)
 
 This mode is called as "HPC" referenced as (High Performance Computing) since every statement is 
-inside single function as argument. This enables interpreter to call a single function and give the necessary information
-about nested arguments inside to that function. After that, there will be no interpreter overhead since every call will be
-handled as bin-to-bin calls (native speed). 
+inside single function as argument. This enables interpreter to call a single bin function (do.bin is an example at below) and give the necessary information about nested arguments inside to that bin. After that, there will be no interpreter overhead since every call will be handled as bin-to-bin calls (native speed). 
 
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
