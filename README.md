@@ -118,8 +118,9 @@ main = do(
 ```
 * Example of Code (Dynamic mode)
 
-This mode is called Dynamic mode since one can change the optivar script code at runtime. This enables code to be fully dynamic 
-by interpreter calling every bin by itself. Losing some overhead at speed will benefit the user to change the code input at runtime.
+This mode is called as "Dynamic" since every statement is splitted line by line approach.
+This enables interpreter to call a each bin at run-time. While it adds some overhead at runtime since interpreter does the
+execution, it enables user to dynamically change the script code at run-time. Since it will be fully dynamic but slower.
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
 -- (assuming include.bin and lib.bin exists. Also for this case lib.bin has other functions below in single merged bin)
