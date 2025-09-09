@@ -143,7 +143,8 @@ all calls here is interpreter to bin calls. We lazy/preload them here assuming t
 into one single bin file, the only overhead of Optivar (for HPC case where all statements are arguments of a single function)
 is first interpreter-to-bin call. Meaning it is a **startup speed overhead (one-time event).** Overall execution speed can be equal/faster
 since all bins are planned to be written for hardware infrastructure's assembly programming language and then transformed into bin.
-This allows language like Optivar (which is actually an interpreter) that can race with compilers in HPC tasks.
+This allows language like Optivar (which is actually an interpreter) that can race with compilers in HPC tasks for medium/large scale tasks.
+We dont expect optivar to beat Asm/C/C++ in micro-task HPC.
 
 ## Authors
 Fikret Güney Ersezer
