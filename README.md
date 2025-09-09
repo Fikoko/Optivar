@@ -120,7 +120,7 @@ main = do(
 * Example of Code (Dynamic mode)
 
 This mode is called as "Dynamic" since every statement is splitted line by line approach.
-This enables interpreter to call a each bin at run-time. While it adds some overhead at runtime since interpreter does the
+This enables interpreter to call each bin at run-time. While it adds some overhead at runtime since interpreter does the
 execution, it enables user to dynamically change the script code at run-time. (Important thing here is that
 all calls here is interpreter to bin calls. We lazy/preload them here assuming they are multiple independent bins)
 ```
