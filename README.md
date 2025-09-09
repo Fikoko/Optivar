@@ -89,7 +89,7 @@ The concept of a declarative, minimalist language for both high-level users and 
 
 | Feature                                 | Description                                                                    |
 | --------------------------------------- | ------------------------------------------------------------------------------ |
-| **Strictly declarative**                | No manual creation of anything — just function calls                           |
+| **declarative**                         | No manual creation of anything — just function calls                           |
 | **Function-only**                       | Every operation (arithmetic, variables, control flows, I/O etc...) is function |
 | **Library-based execution**             | Everything come from external libraries                                        |
 | **Natural language-inspired structure** | Heavy emphasis on readability, flow, and structured comments                   |
