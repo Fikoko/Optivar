@@ -100,7 +100,8 @@ The concept of a declarative, minimalist language for both high-level users and 
 
 This mode is called as "HPC" referenced as (High Performance Computing) since every statement is 
 inside single function as argument. This enables interpreter to call a single bin function (do.bin is an example at below) and give the necessary information about nested arguments inside to that bin. After that, there will be no interpreter overhead since every call will be handled as bin-to-bin calls which is native speed. (Important thing here is that
-we assume bin-to-bin calls exists since they are not merged into single bin. We lazy/preload them here assuming they are multiple independent bins)
+we assume bin-to-bin calls exists since they are not merged into single bin. Currently here we lazy/preload them here assuming they are multiple independent bins. But we can make
+a system where user can select te necessary bins that he will use in his work and then merge them into single monolithic bin. This would eliminate the bin-to-bin calls.)
 
 ```
 -- add_numbers.optivar: Read two undeclared numbers, add them and return the sum 
