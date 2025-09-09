@@ -109,7 +109,7 @@ a system where user can select te necessary bins that he will use in his work an
 
 main = do(
 
- my_lib = include("lib.bin", "C://user/libs/")  ,   
+ my_lib = include("lib.bin", "C://user//libs//")  ,   
  a = read_undec_num()  ,                          
  b = read_undec_num()  ,                          
  b = add_undec_num(a, b)  ,                       
@@ -128,7 +128,7 @@ all calls here is interpreter to bin calls. We lazy/preload them here assuming t
 -- (assuming include.bin and lib.bin exists. Also for this case lib.bin has other functions below in single merged bin)
 
 
- my_lib = include("lib.bin", "C://user/libs/")    
+ my_lib = include("lib.bin", "C://user//libs//")    
  a = read_undec_num()                            
  b = read_undec_num()                          
  b = add_undec_num(a, b)                       
@@ -137,14 +137,19 @@ all calls here is interpreter to bin calls. We lazy/preload them here assuming t
 ```
 ### Questions 
 
-1) Why not just use Asm/C/C++ for static HPC tasks ?
+1) Why not just use Asm/C/C++ etc... for all static HPC tasks ?
    
 **At nanosecond (or smaller) scales, execution speed dominates.** Assuming that all bins that will be used as functions are merged
 into one single bin file, the only overhead of Optivar (for HPC case where all statements are arguments of a single function)
 is first interpreter-to-bin call. Meaning it is a **startup speed overhead (one-time event).** Overall execution speed can be equal/faster
 since all bins are planned to be written for hardware infrastructure's assembly programming language and then transformed into bin.
-This allows language like Optivar (which is actually an interpreter) that can race with compilers in HPC tasks for medium/large scale tasks.
-We dont expect optivar to beat Asm/C/C++ in micro-task HPC.
+This allows language like Optivar (which is actually an interpreter) that can race with compilers in HPC tasks for medium/large scale tasks that are generally continous and has state. We dont expect optivar to beat Asm/C/C++ in static micro-task HPCs where really small and single-use-cases of codes. Optivar sacrifices startup speed to flexibility/development speed. Meanwhile it has same/more execution speed depending on comparisons to Asm/C/C++.
+
+2) Why not just use Python/JavaScript/PHP etc... for all dynamic tasks ?
+
+**For dynamic tasks, flexibility dominates over raw execution speed.** Traditional dynamic languages like Python, JavaScript, PHP etc... provide rapid development, on-the-fly type handling, and runtime script modifications, but they incur more interpreter overhead, runtime type checks, and garbage collection, which can slow down execution for medium/large-scale or continuous workflows. Optivar lose some of the **instant flexibility** that purely interpreted languages provide **(interpreted build in instructions, type checking)**, but gain modular performance with runtime modification.
+
+Note: As you can see in the example codes, one can transform the code form from dynamic mode (rapid development, flexibility) to HPC mode (high performance computing) form by taking all of the statements into a single function which seperates its own arguments by comma. 
 
 ## Authors
 Fikret Güney Ersezer
