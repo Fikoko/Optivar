@@ -2135,6 +2135,8 @@ int main(int argc, char **argv) {
                 var_table_size = 1 << (32 - __builtin_clz(var_table_size - 1));
                 fprintf(stderr, "Warning: table-size rounded to power of two: %d\n", var_table_size);
             }
+        } else if (strncmp(argv[i], "--func-dir=", 11) == 0) {
+            func_directory = argv[i] + 11;
         } else if (strcmp(argv[i], "--preload") == 0) {
             preload_all = 1;
         } else if (strncmp(argv[i], "--preload=list:", 15) == 0) {
