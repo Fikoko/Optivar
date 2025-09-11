@@ -41,10 +41,6 @@ output = f(input1, input2, input3, ...)
  -- comment 
 ```
 
-For simplicity, it is translated to natural language as:
-
-"make functional translation f of inputs (variables/arguments/statements) x1, x2 , x3 ... as equivalent of the output (variable/argument/statements) y1"
-
 ## Getting Started
 
 [![Community](https://img.shields.io/badge/Community-Join-blue.svg)](https://github.com/Fikoko/Optivar/discussions) 
@@ -52,10 +48,6 @@ For simplicity, it is translated to natural language as:
 Copyright © 2025 Fikret Güney Ersezer. All rights reserved.
 
 See the end of this file for further copyright and license information.
-
-### Dependencies
-
-* Regardless of future releases of libraries, the logic behind parsing and debugging will not change. Any dependency issue is related with the library conditions.
 
 ### How to build and run the Optivar IR executor
 
