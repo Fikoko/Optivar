@@ -1871,6 +1871,71 @@ static void run_script_enhanced(const char* path) {
     // No special "HPC mode" - just regular execution with optional monitoring
     if (dry_run_mode) return;
     
+    // Cross-platform file monitoring
+    FileWatcher* watcher = create_file_watcher(path);
+    if (!watcher) {
+        // Fallback to simple polling
+        time_t last_mod = get_file_mtime(path);
+        while (1) {
+            time_t current_mod = get_file_mtime(path);
+            if (current_mod > last_mod) {
+                last_mod = current_mod;
+                
+                // Clear environment
+                for (int i = 0; i < var_count; i++) {
+                    if (env_array[i] && env_array[i]->value) {
+                        value_release(env_array[i]->value);
+                        env_array[i]->value = NULL;
+                    }
+                }
+                
+                // Re-parse and execute
+                IR* new_ir = parse_script_file_enhanced(path);
+                if (new_ir) {
+                    executor_enhanced(new_ir->stmts, new_ir->count, env_array);
+                }
+            }
+            sleep(1);
+        }
+    } else {
+        // Use platform-specific file monitoring
+        while (1) {
+            if (check_file_changed(watcher)) {
+                // Clear environment
+                for (int i = 0; i < var_count; i++) {
+                    if (env_array[i] && env_array[i]->value) {
+                        value_release(env_array[i]->value);
+                        env_array[i]->value = NULL;
+                    }
+                }
+                
+                // Re-parse and execute
+                IR* new_ir = parse_script_file_enhanced(path);
+                if (new_ir) {
+                    executor_enhanced(new_ir->stmts, new_ir->count, env_array);
+                }
+            }
+            sleep(1);
+        }
+        
+        destroy_file_watcher(watcher);
+    }
+}
+            fprintf(stderr, ")");
+        }
+        if (last_error.context[0]) {
+            fprintf(stderr, "\nContext: %s", last_error.context);
+        }
+        fprintf(stderr, "\n");
+        return;
+    }
+    
+    // Execute statements - all functions can have block arguments
+    executor_enhanced(ir->stmts, ir->count, env_array);
+    
+    // No special "HPC mode" - just regular execution with optional monitoring
+    if (dry_run_mode) return;
+    
     // Dynamic mode: Monitor file changes if not in dry-run
     int fd = inotify_init();
     if (fd < 0) {
