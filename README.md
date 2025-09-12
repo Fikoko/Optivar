@@ -40,6 +40,28 @@ output = f(input1, input2, input3, ...)
 ```
  -- comment 
 ```
+## Command-Line Options
+```
+--fixed-vars=N
+
+--table-size=N
+
+--func-dir=DIR
+
+--preload
+
+--preload=list:a,b
+
+--non-strict
+
+--dry-run
+
+--test-escapes
+
+--test-strict
+
+--test-all
+```
 
 ## Getting Started
 
