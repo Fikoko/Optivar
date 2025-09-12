@@ -56,8 +56,16 @@ See the end of this file for further copyright and license information.
 git clone https://github.com/Fikoko/optivar.git
 cd optivar
 
-# Compile the single source file
-gcc -O3 -march=native -lz -o optivar optivar.c
+# Then build accourding to your os
+
+  # Linux/Unix
+  gcc -O3 -std=gnu11 -lz -o optivar optivar.c
+  
+  # Windows
+  gcc -O3 -std=gnu11 -lz -o optivar.exe optivar.c
+  
+  # macOS  
+  clang -O3 -std=gnu11 -lz -o optivar optivar.c
 
 # Run a script
 ./optivar path/to/your/script.optivar
