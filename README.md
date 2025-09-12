@@ -42,7 +42,7 @@ output = f(input1, input2, input3, ...)
 ```
 ## Command-Line Options
 
-Command-line options for interpreter based on standard conventions and your code structure:
+Command-line options for interpreter based on standard conventions and code structure:
 
 ```
 --fixed-vars=N
