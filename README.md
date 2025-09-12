@@ -36,7 +36,7 @@ Researchers can implement **low-level operations** (like arithmetic, control str
 output = f(input1, input2, input3, ...)
 ```
 
-2. **Function call** 
+2. **Comments in Script** 
 ```
  -- comment 
 ```
