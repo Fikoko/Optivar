@@ -1,5 +1,7 @@
-// optivar.c -- Enhanced superoptimized, memory-safe, minimal, scalable IR executor with strict syntax 
-// Build: gcc -O3 -march=native -lz -o optivar optivar.c
+//
+// optivar.c -- Fully cross-platform, memory-safe, monolithic IR executor
+// Build: gcc -O3 -o optivar optivar.c  (works on Windows, Linux, macOS)
+//
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -13,7 +15,6 @@
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
-#include <zlib.h>
 
 #if defined(_WIN32) || defined(_WIN64)
     #include <windows.h>
@@ -31,11 +32,11 @@
 #if defined(_WIN32) || defined(_WIN64)
     #define sleep_ms(ms) Sleep(ms)
     #define PATH_SEPARATOR '\\'
-    #define LOAD_LIB(path) LoadLibrary(path)
+    #define LOAD_LIB(path) LoadLibraryA(path)
     #define GET_FUNC(lib, name) GetProcAddress(lib, name)
     #define CLOSE_LIB(lib) FreeLibrary(lib)
     #define FILE_MOD_TIME(path, out) { \
-        HANDLE hFile = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); \
+        HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); \
         if (hFile != INVALID_HANDLE_VALUE) { \
             FILETIME ft; \
             if (GetFileTime(hFile, NULL, NULL, &ft)) { \
@@ -104,7 +105,6 @@ static void set_error(ErrorCode code, int line, int column, const char* fmt, ...
     last_error.code = code;
     last_error.line = line;
     last_error.column = column;
-    
     va_list args;
     va_start(args, fmt);
     vsnprintf(last_error.message, MAX_ERROR_LEN - 1, fmt, args);
@@ -180,6 +180,18 @@ typedef struct IRStmt {
     char pad[CACHE_LINE - 5*sizeof(int) - sizeof(void*) - sizeof(Value**) - MAX_NAME_LEN];
 } IRStmt;
 
+typedef struct StatementBlock {
+    IRStmt* stmts;
+    int count;
+    int capacity;
+} StatementBlock;
+
+typedef struct IR {
+    IRStmt* stmts;
+    int count;
+    int capacity;
+} IR;
+
 // Static assertions for cache alignment
 static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
 static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
@@ -192,18 +204,6 @@ typedef struct BinContext {
     struct FuncEntry* func_table;
     int func_count;
 } BinContext;
-
-typedef struct IR {
-    IRStmt* stmts;
-    int count;
-    int capacity;
-} IR;
-
-typedef struct StatementBlock {
-    IRStmt* stmts;
-    int count;
-    int capacity;
-} StatementBlock;
 
 //
 // Unlimited Arena - All allocations go through here for no leaks
@@ -241,7 +241,6 @@ static ArenaChunk* arena_new_chunk(size_t min_size) {
 
 void* arena_alloc_unlimited(size_t size) {
     size = (size + 7) & ~7;
-    
     if (!arena_current || arena_current->used + size > arena_current->size) {
         ArenaChunk* new_chunk = arena_new_chunk(size);
         if (!arena_head) {
@@ -251,7 +250,6 @@ void* arena_alloc_unlimited(size_t size) {
             arena_current = new_chunk;
         }
     }
-    
     void* ptr = arena_current->ptr + arena_current->used;
     arena_current->used += size;
     memset(ptr, 0, size);
