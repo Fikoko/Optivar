@@ -67,8 +67,14 @@ cd optivar
   # macOS  
   clang -O3 -std=gnu11 -lz -o optivar optivar.c
 
-# Run a script
-./optivar path/to/your/script.optivar
+# Use custom directory
+./optivar script.optivar --func-dir=/path/to/my/functions
+
+# Use relative path
+./optivar script.optivar --func-dir=../shared-funcs
+
+# Use absolute path
+./optivar script.optivar --func-dir=/usr/local/lib/optivar-funcs
 ```
 
 ### Historical Context and Novelty
