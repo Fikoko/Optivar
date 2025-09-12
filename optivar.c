@@ -2221,6 +2221,12 @@ int main(int argc, char **argv) {
         }
     }
     
+    // Show platform info if requested
+    if (show_platform_flag) {
+        print_platform_info();
+        return 0;
+    }
+    
     // Run tests if requested
     if (run_all_tests_flag || run_escape_tests_flag) {
         run_escape_tests();
