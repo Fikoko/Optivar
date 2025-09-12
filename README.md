@@ -93,11 +93,11 @@ cd optivar
 
 # Then build accourding to your os
 
-  # Linux/Unix
-  gcc -O3 -std=gnu11 -lz -o optivar optivar.c
-  
-  # Windows
-  gcc -O3 -std=gnu11 -lz -o optivar.exe optivar.c
+  # For Linux/macOS
+  gcc -O3 -o optivar optivar.c
+
+  # For Windows (with MinGW)
+  gcc -O3 -o optivar.exe optivar.c
   
   # macOS  
   clang -O3 -std=gnu11 -lz -o optivar optivar.c
