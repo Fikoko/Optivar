@@ -8,18 +8,57 @@
 #include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
-#include <dirent.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <zlib.h>
 #include <limits.h>
 #include <assert.h>
-#include <sys/inotify.h>
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
+#include <zlib.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+    #include <windows.h>
+    #include <io.h>
+    #include <direct.h>
+#else
+    #include <dirent.h>
+    #include <unistd.h>
+    #include <sys/stat.h>
+    #include <fcntl.h>
+    #include <dlfcn.h>
+#endif
+
+// ----------------- Platform abstraction -----------------
+#if defined(_WIN32) || defined(_WIN64)
+    #define sleep_ms(ms) Sleep(ms)
+    #define PATH_SEPARATOR '\\'
+    #define LOAD_LIB(path) LoadLibrary(path)
+    #define GET_FUNC(lib, name) GetProcAddress(lib, name)
+    #define CLOSE_LIB(lib) FreeLibrary(lib)
+    #define FILE_MOD_TIME(path, out) { \
+        HANDLE hFile = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); \
+        if (hFile != INVALID_HANDLE_VALUE) { \
+            FILETIME ft; \
+            if (GetFileTime(hFile, NULL, NULL, &ft)) { \
+                ULARGE_INTEGER ull; \
+                ull.LowPart = ft.dwLowDateTime; \
+                ull.HighPart = ft.dwHighDateTime; \
+                *(out) = (time_t)(ull.QuadPart / 10000000ULL - 11644473600ULL); \
+            } \
+            CloseHandle(hFile); \
+        } else *(out) = 0; \
+    }
+#else
+    #define sleep_ms(ms) usleep((ms) * 1000)
+    #define PATH_SEPARATOR '/'
+    #define LOAD_LIB(path) dlopen(path, RTLD_NOW)
+    #define GET_FUNC(lib, name) dlsym(lib, name)
+    #define CLOSE_LIB(lib) dlclose(lib)
+    #define FILE_MOD_TIME(path, out) { \
+        struct stat st; \
+        if (stat(path, &st) == 0) *(out) = st.st_mtime; \
+        else *(out) = 0; \
+    }
+#endif
 
 //
 // Tunables
@@ -1864,115 +1903,23 @@ static void run_script_enhanced(const char* path) {
         fprintf(stderr, "\n");
         return;
     }
-    
-    // Execute statements - all functions can have block arguments
+
+    // Execute initial statements
     executor_enhanced(ir->stmts, ir->count, env_array);
-    
-    // No special "HPC mode" - just regular execution with optional monitoring
+
     if (dry_run_mode) return;
-    
-    // Cross-platform file monitoring
-    FileWatcher* watcher = create_file_watcher(path);
-    if (!watcher) {
-        // Fallback to simple polling
-        time_t last_mod = get_file_mtime(path);
-        while (1) {
-            time_t current_mod = get_file_mtime(path);
-            if (current_mod > last_mod) {
-                last_mod = current_mod;
-                
-                // Clear environment
-                for (int i = 0; i < var_count; i++) {
-                    if (env_array[i] && env_array[i]->value) {
-                        value_release(env_array[i]->value);
-                        env_array[i]->value = NULL;
-                    }
-                }
-                
-                // Re-parse and execute
-                IR* new_ir = parse_script_file_enhanced(path);
-                if (new_ir) {
-                    executor_enhanced(new_ir->stmts, new_ir->count, env_array);
-                }
-            }
-            sleep(1);
-        }
-    } else {
-        // Use platform-specific file monitoring
-        while (1) {
-            if (check_file_changed(watcher)) {
-                // Clear environment
-                for (int i = 0; i < var_count; i++) {
-                    if (env_array[i] && env_array[i]->value) {
-                        value_release(env_array[i]->value);
-                        env_array[i]->value = NULL;
-                    }
-                }
-                
-                // Re-parse and execute
-                IR* new_ir = parse_script_file_enhanced(path);
-                if (new_ir) {
-                    executor_enhanced(new_ir->stmts, new_ir->count, env_array);
-                }
-            }
-            sleep(1);
-        }
-        
-        destroy_file_watcher(watcher);
-    }
-}
-            fprintf(stderr, ")");
-        }
-        if (last_error.context[0]) {
-            fprintf(stderr, "\nContext: %s", last_error.context);
-        }
-        fprintf(stderr, "\n");
-        return;
-    }
-    
-    // Execute statements - all functions can have block arguments
-    executor_enhanced(ir->stmts, ir->count, env_array);
-    
-    // No special "HPC mode" - just regular execution with optional monitoring
-    if (dry_run_mode) return;
-    
-    // Dynamic mode: Monitor file changes if not in dry-run
-    int fd = inotify_init();
-    if (fd < 0) {
-        // Fallback to polling
-        time_t last_mod = 0;
-        struct stat st;
-        while (1) {
-            if (stat(path, &st) == 0 && st.st_mtime > last_mod) {
-                last_mod = st.st_mtime;
-                // Clear environment
-                for (int i = 0; i < var_count; i++) {
-                    if (env_array[i] && env_array[i]->value) {
-                        value_release(env_array[i]->value);
-                        env_array[i]->value = NULL;
-                    }
-                }
-                // Re-parse and execute
-                IR* new_ir = parse_script_file_enhanced(path);
-                if (new_ir) {
-                    executor_enhanced(new_ir->stmts, new_ir->count, env_array);
-                }
-            }
-            sleep(1);
-        }
-    } else {
-        int wd = inotify_add_watch(fd, path, IN_MODIFY | IN_CREATE | IN_DELETE);
-        if (wd < 0) {
-            perror("inotify_add_watch");
-            close(fd);
-            return;
-        }
-        
-        while (1) {
-            char buffer[4096];
-            ssize_t len = read(fd, buffer, sizeof(buffer));
-            if (len <= 0) continue;
-            
+
+    // ----------------- Portable file monitoring -----------------
+    time_t last_mod = 0;
+    FILE_MOD_TIME(path, &last_mod);
+
+    while (1) {
+        time_t current_mod;
+        FILE_MOD_TIME(path, &current_mod);
+
+        if (current_mod > last_mod) {
+            last_mod = current_mod;
+
             // Clear environment
             for (int i = 0; i < var_count; i++) {
                 if (env_array[i] && env_array[i]->value) {
@@ -1980,17 +1927,18 @@ static void run_script_enhanced(const char* path) {
                     env_array[i]->value = NULL;
                 }
             }
+
             // Re-parse and execute
             IR* new_ir = parse_script_file_enhanced(path);
             if (new_ir) {
                 executor_enhanced(new_ir->stmts, new_ir->count, env_array);
             }
         }
-        
-        inotify_rm_watch(fd, wd);
-        close(fd);
+
+        sleep_ms(1000); // 1 second polling
     }
 }
+
 
 //
 // Testing and Debugging Support
