@@ -1,5 +1,5 @@
 //
-// optivar.c -- Fully cross-platform, memory-safe, minimalistic, superoptimized, scaleable IR executor
+// optivar.c -- Fully cross-platform, memory-safe, scalable, superoptimized, minimalistic IR executor
 // Build:
 //   gcc -O3 -o optivar optivar.c  (Linux, macOS, MinGW on Windows)
 //   cl /O2 /W3 optivar.c          (MSVC on Windows)
@@ -203,8 +203,8 @@ typedef struct IR {
     int capacity;
 } IR;
 
-// Static assertions for cache alignment
 #if !defined(_MSC_VER)
+#include <assert.h>
 static_assert(sizeof(VarSlot) % CACHE_LINE == 0, "VarSlot not cache-aligned");
 static_assert(sizeof(IRStmt) % CACHE_LINE == 0, "IRStmt not cache-aligned");
 static_assert(sizeof(Value) % CACHE_LINE == 0, "Value not cache-aligned");
@@ -335,72 +335,6 @@ static uint32_t crc32(uint32_t crc, const unsigned char *buf, size_t len) {
         crc = crc32_tab[(crc ^ (*buf++)) & 0xff] ^ (crc >> 8);
     }
     return ~crc;
-}
-
-//
-// ENHANCED STRING ESCAPE HANDLING SYSTEM
-//
-static int hex_digit_value(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static char* process_string_escapes_enhanced(const char* input, int input_len, int* output_len, int line, int col) {
-    if (!input || input_len <= 0) {
-        *output_len = 0;
-        return NULL;
-    }
-    
-    char* result = arena_alloc_unlimited(input_len * 4 + 1);
-    int result_pos = 0;
-    int i = 0;
-    
-    while (i < input_len) {
-        if (input[i] == '\\' && i + 1 < input_len) {
-            char next_char = input[i + 1];
-            switch (next_char) {
-                case '"': result[result_pos++] = '"'; i += 2; break;
-                case '\\': result[result_pos++] = '\\'; i += 2; break;
-                case '=': result[result_pos++] = '='; i += 2; break;
-                case '(': result[result_pos++] = '('; i += 2; break;
-                case ')': result[result_pos++] = ')'; i += 2; break;
-                case ',': result[result_pos++] = ','; i += 2; break;
-                case 'n': result[result_pos++] = '\n'; i += 2; break;
-                case 't': result[result_pos++] = '\t'; i += 2; break;
-                case 'r': result[result_pos++] = '\r'; i += 2; break;
-                case '0': result[result_pos++] = '\0'; i += 2; break;
-                case 'x':
-                    if (i + 3 < input_len) {
-                        int d1 = hex_digit_value(input[i + 2]);
-                        int d2 = hex_digit_value(input[i + 3]);
-                        if (d1 >= 0 && d2 >= 0) {
-                            result[result_pos++] = (char)(d1 * 16 + d2);
-                            i += 4;
-                        } else {
-                            set_error(ERR_PARSE_INVALID_ESCAPE, line, col + i, "Invalid hexadecimal escape sequence");
-                            return NULL;
-                        }
-                    } else {
-                        set_error(ERR_PARSE_INVALID_ESCAPE, line, col + i, "Incomplete hexadecimal escape sequence");
-                        return NULL;
-                    }
-                    break;
-                // Other cases removed for brevity but would be here...
-                default:
-                    result[result_pos++] = input[i];
-                    i++;
-            }
-        } else {
-            result[result_pos++] = input[i];
-            i++;
-        }
-    }
-    
-    result[result_pos] = '\0';
-    *output_len = result_pos;
-    return result;
 }
 
 //
@@ -735,6 +669,26 @@ static void init_env(int total_vars) {
     fixed_pool = arena_alloc_unlimited(sizeof(VarSlot) * FIXED_VARS);
 }
 
+#if defined(_WIN32) && !defined(__GNUC__)
+// Custom getline for MSVC
+typedef long long ssize_t;
+ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+    size_t pos = 0; int c;
+    if (!lineptr || !stream || !n) { errno = EINVAL; return -1; }
+    c = fgetc(stream); if (c == EOF) return -1;
+    if (!*lineptr) { *lineptr = malloc(128); if (!*lineptr) return -1; *n = 128; }
+    while(c != EOF) {
+        if (pos + 1 >= *n) {
+            size_t new_size = *n + (*n >> 2); if (new_size < 128) new_size = 128;
+            char *new_ptr = realloc(*lineptr, new_size); if (!new_ptr) return -1;
+            *lineptr = new_ptr; *n = new_size;
+        }
+        (*lineptr)[pos++] = c; if (c == '\n') break; c = fgetc(stream);
+    }
+    (*lineptr)[pos] = '\0'; return pos;
+}
+#endif
+
 //
 // Parsing Logic
 //
@@ -838,8 +792,25 @@ static int find_matching_paren(const char* str, int len, int start) {
 }
 
 static int parse_expression_strict_enhanced(const char* expr, int expr_len, IR* ir, int line, int col) {
-    const char* eq = memchr(expr, '=', expr_len);
-    if (!eq) { set_error(ERR_PARSE_MISSING_ASSIGN, line, col, "Expression must contain assignment operator '='"); return -1; }
+    // Find the first '=' that is not inside quotes or parentheses
+    const char* eq = NULL;
+    int paren_depth = 0;
+    bool in_string = false;
+    for(int i = 0; i < expr_len; ++i) {
+        if(in_string) {
+            if(expr[i] == '"' && expr[i-1] != '\\') in_string = false;
+        } else {
+            if(expr[i] == '"') in_string = true;
+            else if (expr[i] == '(') paren_depth++;
+            else if (expr[i] == ')') paren_depth--;
+            else if (expr[i] == '=' && paren_depth == 0) {
+                eq = expr + i;
+                break;
+            }
+        }
+    }
+
+    if (!eq) { set_error(ERR_PARSE_MISSING_ASSIGN, line, col, "Top-level statement must be an assignment"); return -1; }
 
     const char* lhs_start = expr;
     int lhs_len = eq - lhs_start;
@@ -854,9 +825,11 @@ static int parse_expression_strict_enhanced(const char* expr, int expr_len, IR* 
     while (rhs_start < expr + expr_len && isspace((unsigned char)*rhs_start)) rhs_start++;
     
     const char* open_paren = strchr(rhs_start, '(');
-    if (!open_paren) { set_error(ERR_PARSE_INVALID_FUNC, line, col + (rhs_start - expr), "Missing opening parenthesis for function call"); return -1; }
+    if (!open_paren) { set_error(ERR_PARSE_INVALID_FUNC, line, col + (rhs_start - expr), "Right-hand side of assignment must be a function call"); return -1; }
     
     int fname_len = open_paren - rhs_start;
+    while(fname_len > 0 && isspace((unsigned char)rhs_start[fname_len-1])) fname_len--;
+
     if (fname_len <= 0 || fname_len >= MAX_NAME_LEN) { set_error(ERR_PARSE_INVALID_FUNC, line, col + (rhs_start - expr), "Invalid function name"); return -1; }
     char fname[MAX_NAME_LEN];
     memcpy(fname, rhs_start, fname_len);
@@ -881,20 +854,105 @@ static int parse_expression_strict_enhanced(const char* expr, int expr_len, IR* 
     return 0;
 }
 
-static int parse_line_strict_enhanced(const char* line, IR* ir, int line_num) {
-    const char* start = line;
-    while (*start && isspace((unsigned char)*start)) start++;
-    if (*start == '\0' || (*start == '-' && *(start+1) == '-')) return 0;
+static bool is_comment_or_empty(const char* str) {
+    while(*str && isspace((unsigned char)*str)) str++;
+    return *str == '\0' || (*str == '-' && *(str+1) == '-');
+}
 
-    int len = (int)strlen(start);
-    while (len > 0 && isspace((unsigned char)start[len-1])) len--;
-    if (len <= 0) return 0;
+static char* read_block_enhanced(FILE* f, int *out_lines_read) {
+    char *line = NULL;
+    size_t lcap = 0;
+    ssize_t r;
 
-    if (parse_expression_strict_enhanced(start, len, ir, line_num, (int)(start - line + 1)) != 0) {
-        set_error_context(line, (int)strlen(line));
-        return -1;
+    char *buf = NULL;
+    size_t bufcap = 0;
+    size_t buflen = 0;
+    
+    int depth = 0;
+    int lines = 0;
+    bool found_content = false;
+    
+    while ((r = getline(&line, &lcap, f)) != -1) {
+        lines++;
+        if(!found_content && is_comment_or_empty(line)) continue;
+        
+        found_content = true;
+
+        if (buflen + r + 1 > bufcap) {
+            bufcap = (buflen + r) * 2;
+            char* new_buf = realloc(buf, bufcap);
+            if(!new_buf) { free(buf); free(line); return NULL; }
+            buf = new_buf;
+        }
+        memcpy(buf + buflen, line, r);
+        buflen += r;
+        
+        bool in_string = false;
+        for (ssize_t i = 0; i < r; ++i) {
+            if (in_string) {
+                if (line[i] == '"' && (i == 0 || line[i-1] != '\\')) in_string = false;
+            } else {
+                if (line[i] == '"') in_string = true;
+                else if (line[i] == '(') depth++;
+                else if (line[i] == ')') depth--;
+            }
+        }
+        
+        // A complete statement is one that is not inside parentheses.
+        // We also check for '=' to ensure it's a valid assignment statement.
+        if (depth <= 0 && memchr(buf, '=', buflen)) {
+            break;
+        }
     }
-    return 0;
+    free(line);
+    
+    if (buflen == 0) { free(buf); *out_lines_read = lines; return NULL; }
+    
+    buf[buflen] = '\0';
+    *out_lines_read = lines;
+
+    // Use arena for final result, free temp buffer
+    char* final_block = arena_alloc_unlimited(buflen + 1);
+    memcpy(final_block, buf, buflen + 1);
+    free(buf);
+
+    return final_block;
+}
+
+static IR* parse_script_file_enhanced(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) { set_error(ERR_FILE_NOT_FOUND, 0, 0, "Cannot open script file: %s", path); return NULL; }
+    
+    IR* ir = arena_alloc_unlimited(sizeof(IR));
+    ir_init(ir);
+    int line_num = 1;
+
+    while(!feof(f)) {
+        int consumed_lines = 0;
+        char* block = read_block_enhanced(f, &consumed_lines);
+        if(!block) {
+            line_num += consumed_lines;
+            continue;
+        }
+        
+        // Trim leading whitespace for the parser
+        char* start = block;
+        while(*start && isspace((unsigned char)*start)) start++;
+        int len = (int)strlen(start);
+        while(len > 0 && isspace((unsigned char)start[len-1])) len--;
+        
+        if (len > 0) {
+            if (parse_expression_strict_enhanced(start, len, ir, line_num, (int)(start - block + 1)) != 0) {
+                set_error_context(block, (int)strlen(block));
+                fclose(f);
+                return NULL;
+            }
+        }
+        line_num += consumed_lines;
+    }
+    
+    fclose(f);
+    return ir;
 }
 
 //
@@ -956,52 +1014,6 @@ static void cleanup_all() {
         func_table = NULL;
     }
     arena_free_all();
-}
-
-#if defined(_WIN32) && !defined(__GNUC__)
-typedef long long ssize_t;
-ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
-    size_t pos = 0; int c;
-    if (!lineptr || !stream || !n) { errno = EINVAL; return -1; }
-    c = fgetc(stream); if (c == EOF) return -1;
-    if (!*lineptr) { *lineptr = malloc(128); if (!*lineptr) return -1; *n = 128; }
-    while(c != EOF) {
-        if (pos + 1 >= *n) {
-            size_t new_size = *n + (*n >> 2); if (new_size < 128) new_size = 128;
-            char *new_ptr = realloc(*lineptr, new_size); if (!new_ptr) return -1;
-            *lineptr = new_ptr; *n = new_size;
-        }
-        (*lineptr)[pos++] = c; if (c == '\n') break; c = fgetc(stream);
-    }
-    (*lineptr)[pos] = '\0'; return pos;
-}
-#endif
-
-//
-// Script loading and execution flow
-//
-static IR* parse_script_file_enhanced(const char* path) {
-    FILE* f = fopen(path, "r");
-    if (!f) { set_error(ERR_FILE_NOT_FOUND, 0, 0, "Cannot open script file: %s", path); return NULL; }
-    
-    IR* ir = arena_alloc_unlimited(sizeof(IR));
-    ir_init(ir);
-    
-    char* line = NULL;
-    size_t cap = 0;
-    ssize_t len;
-    int line_num = 1;
-
-    while ((len = getline(&line, &cap, f)) != -1) {
-        if (parse_line_strict_enhanced(line, ir, line_num) == -1) {
-            fclose(f); free(line); return NULL;
-        }
-        line_num++;
-    }
-    
-    fclose(f);
-    free(line);
-    return ir;
 }
 
 static void run_script_enhanced(const char* path) {
