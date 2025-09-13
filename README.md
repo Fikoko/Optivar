@@ -54,26 +54,12 @@ Command-line options for interpreter based on standard conventions and code stru
 --func-dir=DIR
 # Specifies a directory containing .bin functions.
 
---preload
-# Preload all .bin functions from the directory into memory at startup.
-
---preload=list:a,b
-# Preload specific functions only, e.g., a.bin and b.bin.
-
 --non-strict
 # Runs the interpreter in non-strict mode, relaxing rules like argument assignment checks.
 
 --dry-run
 # Parse and validate the script without executing it. Useful for syntax checking.
 
---test-escapes
-# Runs tests on string escape handling, e.g., \n, \xHH, \uHHHH.
-
---test-strict
-# Runs tests for strict mode rules, checking argument patterns and validations.
-
---test-all
-# Runs all available internal tests, including escapes, strict mode, and possibly numeric parsing.
 ```
 
 ## Getting Started
